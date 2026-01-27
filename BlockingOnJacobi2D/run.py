@@ -24,11 +24,15 @@ BENCHMARKS = [
 
 # Add tiled configurations (0-15)
 for i in range(16):
-    BENCHMARKS.append(("jacobi2d_tiled.out", f"Tiled-Config{i}", [str(i)]))
+    BENCHMARKS.append(("jacobi2d_tiled.out", f"Tiled-Config-{i}", [str(i)]))
 
 # Add blocked configurations (0-15)
 for i in range(16):
-    BENCHMARKS.append(("jacobi2d_blocked_tiled.out", f"Blocked-Config{i}", [str(i)]))
+    BENCHMARKS.append(("jacobi2d_blocked_tiled.out", f"Blocked-Config-{i}", [str(i)]))
+
+for i in range(16):
+    BENCHMARKS.append(("jacobi2d_blocked_tiled_v2.out", f"Blocked-ConfigV2-{i}", [str(i)]))
+    
 def run_command(cmd):
     """Run a command and return output."""
     try:

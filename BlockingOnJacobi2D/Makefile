@@ -8,7 +8,7 @@ ifneq ($(PAPI_ENABLED),)
 	LDFLAGS += -lpapi
 endif
 
-TARGETS = jacobi2d_baseline.out jacobi2d_tiled.out jacobi2d_boundary.out jacobi2d_blocked_tiled.out
+TARGETS = jacobi2d_baseline.out jacobi2d_tiled.out jacobi2d_boundary.out jacobi2d_blocked_tiled.out jacobi2d_blocked_tiled_v2.out
 
 all: $(TARGETS)
 
@@ -22,6 +22,9 @@ jacobi2d_boundary.out: jacobi2d_boundary.cpp
 	$(CXX) $(CXXFLAGS) -o $@ $< $(LDFLAGS)
 
 jacobi2d_blocked_tiled.out: jacobi2d_blocked_tiled.cpp
+	$(CXX) $(CXXFLAGS) -o $@ $< $(LDFLAGS)
+
+jacobi2d_blocked_tiled_v2.out: jacobi2d_blocked_tiled_v2.cpp
 	$(CXX) $(CXXFLAGS) -o $@ $< $(LDFLAGS)
 
 clean:
