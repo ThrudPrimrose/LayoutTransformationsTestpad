@@ -1,0 +1,44 @@
+# Ignore everything by default
+*
+
+# Allow specific file types
+!*.cpp
+!*.h
+!*.py
+!Makefile
+!CMakeLists.txt
+!*.md
+!*.sh
+!*.cu
+
+# Allow directories (so git can traverse them)
+!*/
+
+# Ignore CSV files explicitly (in case they match above patterns)
+*.csv
+
+# Common build artifacts to explicitly ignore
+*.o
+*.so
+*.a
+*.out
+*.exe
+
+# Build directories
+build/
+cmake-build-*/
+.cmake/
+
+# Python artifacts
+__pycache__/
+*.pyc
+*.pyo
+.pytest_cache/
+
+# Editor/IDE files
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+.DS_Store
