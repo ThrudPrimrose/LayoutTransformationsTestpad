@@ -17,7 +17,7 @@ import re
 N = 8192
 TSTEPS = 200
 NUM_RUNS = 20
-NUM_THREADS = 8
+NUM_THREADS = int(os.environ["OMP_NUM_THREADS"])
 
 # Output CSV file
 OUTPUT_FILE = "jacobi2d_benchmark_results.csv"

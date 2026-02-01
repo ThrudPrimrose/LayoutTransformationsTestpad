@@ -1,5 +1,5 @@
 #!/bin/bash
-#SBATCH --job-name=apapi
+#SBATCH --job-name=aj2d
 #SBATCH --partition=amd
 #SBATCH --nodes=1
 #SBATCH --ntasks=1
@@ -18,6 +18,8 @@ mkdir -p logs results
 spack load gcc@14.2.0
 spack load openssl
 spack load python@3.12.9%gcc@14.2
+spack load openmpi@5.0.6%gcc@14.2
+
 alias python=python3.12
 echo "Compiler:"
 gcc --version

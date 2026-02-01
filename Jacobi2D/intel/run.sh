@@ -1,5 +1,5 @@
 #!/bin/bash
-#SBATCH --job-name=iPaper
+#SBATCH --job-name=ij2d
 #SBATCH --partition=intel
 #SBATCH --nodes=1
 #SBATCH --ntasks=1
@@ -18,6 +18,7 @@ mkdir -p logs results
 spack load gcc@14.2
 spack load python@3.12.9%gcc@14.2
 spack load sqlite
+spack load openmpi@5.0.6%gcc@14.2
 
 echo "Compiler:"
 gcc --version
@@ -29,7 +30,6 @@ export OMP_NUM_THREADS=36
 export OMP_PLACES=cores
 export OMP_PROC_BIND=close
 export OMP_DYNAMIC=false
-
 
 
 unset PAPI_METRICS
