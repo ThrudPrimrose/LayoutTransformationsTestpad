@@ -12,21 +12,22 @@
 class Jacobi2DBaseline {
 public:
     int N;        // Interior size
-    double *A;
-    double *B;
+    double *__restrict__ A;
+    double *__restrict__ B;
     
     Jacobi2DBaseline(int size) : N(size) {
-        A = new double[(N + 2) * (N + 2)];
-        B = new double[(N + 2) * (N + 2)];
+        size_t bytes = (N + 2) * (N + 2) * sizeof(double);
+        A = (double*)std::aligned_alloc(64, bytes);
+        B = (double*)std::aligned_alloc(64, bytes);
     }
     
     ~Jacobi2DBaseline() {
-        delete[] A;
-        delete[] B;
+        std::free(A);
+        std::free(B);
     }
     
     void initialize() {
-        #pragma omp parallel for
+        #pragma omp parallel for schedule(static)
         for (int i = 0; i < (N + 2); i++) {
             for (int j = 0; j < (N + 2); j++) {
                 A[i * (N + 2) + j] = (double)(i * (j + 2)) / N;
@@ -35,9 +36,9 @@ public:
         }
     }
     
-    void run_iteration(double *in, double *out) {
+    void run_iteration(double *__restrict__ in, double *__restrict__ out) {
         // Compute interior points [1..N] (0 and N+1 are boundaries)
-        #pragma omp parallel for
+        #pragma omp parallel for schedule(static)
         for (int i = 1; i <= N; i++) {
             for (int j = 1; j <= N; j++) {
                 out[i * (N + 2) + j] = 0.2 * (in[i * (N + 2) + j] + 
@@ -52,13 +53,13 @@ public:
     double run(int tsteps) {
         double start = omp_get_wtime();
         
-        double *curr = A;
-        double *next = B;
+        double *__restrict__ curr = A;
+        double *__restrict__  next = B;
         
         for (int t = 0; t < tsteps; t++) {
             run_iteration(curr, next);
             // Swap pointers
-            double *tmp = curr;
+            double *__restrict__  tmp = curr;
             curr = next;
             next = tmp;
         }
@@ -69,7 +70,9 @@ public:
     
     double checksum() {
         double sum = 0.0;
+        #pragma omp parallel for reduction(+:sum)
         for (int i = 1; i < (N + 1); i++) {
+            #pragma omp simd
             for (int j = 1; j < (N + 1); j++) {
                 sum += A[i * (N + 2) + j];
             }

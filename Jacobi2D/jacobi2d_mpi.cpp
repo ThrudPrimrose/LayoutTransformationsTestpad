@@ -135,8 +135,8 @@ double checksum(double *u, DomainInfo *domain) {
     int stride = nx + 2;
     double local_sum = 0.0;
     
-    for (int j = 1; j <= ny; j++) {
-        for (int i = 1; i <= nx; i++) {
+    for (int j = 1; j < ny + 1; j++) {
+        for (int i = 1; i < nx + 1; i++) {
             local_sum += u[IDX(j, i, stride)];
         }
     }
@@ -199,8 +199,8 @@ int main(int argc, char **argv) {
     int stride = nx + 2;
     
     // Allocate 1D arrays with ghost cells
-    double *u = (double*)calloc((ny + 2) * stride, sizeof(double));
-    double *u_new = (double*)calloc((ny + 2) * stride, sizeof(double));
+    double *__restrict__ u = (double*)std::aligned_alloc(64, ((ny + 2) * stride * sizeof(double)));
+    double *__restrict__ u_new = (double*)std::aligned_alloc(64, ((ny + 2) * stride * sizeof(double)));
     
     // Initialize to match baseline: A[i][j] = (double)(i * (j + 2)) / N
     // In global coordinates: global_i is row, global_j is column
@@ -247,7 +247,12 @@ int main(int argc, char **argv) {
             }
         }
     }
-    
+
+    if (rank == 0) {
+        printf("Jacobi2D MPI\n");
+        printf("N=%d, tsteps=%d, processor grid=%dx%d\n", N, tsteps, px, py);
+    }
+
     double start_time = MPI_Wtime();
     
     for (int iter = 0; iter < tsteps; iter++) {
@@ -255,7 +260,7 @@ int main(int argc, char **argv) {
         jacobi_step(u, u_new, &domain);
 
         // Swap arrays
-        double *temp = u;
+        double *__restrict__ temp = u;
         u = u_new;
         u_new = temp;
     }
@@ -273,8 +278,8 @@ int main(int argc, char **argv) {
         printf("GFLOPS: %.3f\n", (double)N * N * tsteps * 6 / (end_time - start_time) / 1e9);
     }
     
-    free(u);
-    free(u_new);
+    std::free(u);
+    std::free(u_new);
     
     finalize_domain(&domain);
     MPI_Comm_free(&domain.cart_comm);
