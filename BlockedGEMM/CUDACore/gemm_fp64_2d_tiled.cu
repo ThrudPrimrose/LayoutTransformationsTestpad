@@ -55,6 +55,18 @@
 #define _TN 8
 #endif
 
+#ifndef _M
+#define _M 8192
+#endif
+
+#ifndef _N
+#define _N 8192
+#endif
+
+#ifndef _K
+#define _K 8192
+#endif
+
 /**
  * 2D Block-Tiled Matrix Multiplication Kernel for FP64 (column-major)
  *
@@ -292,6 +304,8 @@ double benchmark_cublas(int M, int N, int K,
 {
     cublasHandle_t handle;
     CUBLAS_CHECK( cublasCreate(&handle) );
+    //CUBLAS_CHECK(cublasSetMathMode(handle, CUBLAS_DEFAULT_MATH));
+    CUBLAS_CHECK(cublasSetMathMode(handle, CUBLAS_PEDANTIC_MATH));
 
     // Warmup
     CUBLAS_CHECK( cublasDgemm(
@@ -464,9 +478,9 @@ extern "C" {
  * Example usage - Test a specific configuration
  */
 int main() {
-    const int M = 4096;
-    const int N = 4096;
-    const int K = 4096;
+    const int M = _M;
+    const int N = _N;
+    const int K = _K;
 
     // Test configuration (must match compile-time _BM/_BN/_BK/_TM/_TN)
     const int BM = _BM;

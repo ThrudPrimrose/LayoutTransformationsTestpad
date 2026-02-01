@@ -56,6 +56,18 @@
 #define _TN 8
 #endif
 
+#ifndef _M
+#define _M 8192
+#endif
+
+#ifndef _N
+#define _N 8192
+#endif
+
+#ifndef _K
+#define _K 8192
+#endif
+
 /**
  * Convert column-major 2D matrix to 4D tensor layout
  * Input: column-major matrix of size (rows x cols)
@@ -588,9 +600,9 @@ extern "C" {
 }
 
 int main() {
-    const int M = 4096;
-    const int N = 4096;
-    const int K = 4096;
+    const int M = _M;
+    const int N = _N;
+    const int K = _K;
 
     const int BM = _BM;
     const int BN = _BN;

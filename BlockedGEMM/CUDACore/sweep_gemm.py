@@ -1,471 +1,488 @@
 #!/usr/bin/env python3
-"""
-GEMM Tiling Parameter Autotuner
-
-This script compiles and tests different tiling parameter combinations
-for the 2D block-tiled GEMM kernel to find optimal configurations.
-"""
-
 import subprocess
-import os
-import json
+import re
 import csv
+import sys
+from pathlib import Path
 from datetime import datetime
-from typing import List, Tuple, Dict, Optional
+import glob
 import itertools
 
-class GEMMAutotuner:
-    def __init__(self, cuda_file: str = "gemm_fp64_2d_tiled.cu", 
-                 output_dir: str = "tuning_results"):
-        self.cuda_file = cuda_file
-        self.output_dir = output_dir
-        self.results = []
-        
-        # Create output directory
-        os.makedirs(output_dir, exist_ok=True)
-        
-        # GPU constraints
-        self.MAX_THREADS_PER_BLOCK = 1024
-        self.MAX_SHARED_MEMORY = 48 * 1024  # 48 KB in bytes
-        self.DOUBLE_SIZE = 8  # bytes
-        
-    def validate_params(self, BM: int, BN: int, BK: int, TM: int, TN: int) -> Tuple[bool, str]:
-        """Validate tiling parameters against GPU constraints"""
-        
-        # Check divisibility
-        if BM % TM != 0:
-            return False, f"BM ({BM}) must be divisible by TM ({TM})"
-        if BN % TN != 0:
-            return False, f"BN ({BN}) must be divisible by TN ({TN})"
-        
-        # Check thread count
-        threads_per_block = (BM * BN) // (TM * TN)
-        if threads_per_block > self.MAX_THREADS_PER_BLOCK:
-            return False, f"Threads per block ({threads_per_block}) exceeds max ({self.MAX_THREADS_PER_BLOCK})"
-        if threads_per_block <= 0:
-            return False, f"Invalid thread count ({threads_per_block})"
-        
-        # Check shared memory
-        smem_size = (BM * BK + BK * BN) * self.DOUBLE_SIZE
-        if smem_size > self.MAX_SHARED_MEMORY:
-            return False, f"Shared memory ({smem_size} bytes) exceeds max ({self.MAX_SHARED_MEMORY} bytes)"
-        
-        # Check if parameters are powers of 2 or common values
-        # This is a soft constraint for better performance
-        valid_values = [4, 8, 16, 32, 64, 128, 256]
-        if BM not in valid_values or BN not in valid_values:
-            return False, f"BM and BN should be in {valid_values}"
-        if BK not in [4, 8, 16, 32]:
-            return False, f"BK should be in [4, 8, 16, 32]"
-        if TM not in [4, 8, 16] or TN not in [4, 8, 16]:
-            return False, f"TM and TN should be in [4, 8, 16]"
-        
-        return True, "OK"
+if len(sys.argv) > 1:
+    rank = int(sys.argv[1])
+    total_ranks = int(sys.argv[2]) if len(sys.argv) > 2 else 4
+else:
+    rank = 0
+    total_ranks = 1
+
+print(f"Running as rank {rank} of {total_ranks}")
+
+# Extensive parameter sweep configurations
+# Format: (BM, BN, BK, TM, TN)
+PARAM_CONFIGS = [
+    # Original baseline
+    (64, 64, 16, 8, 8),
+
+    # Varying BM (Block M dimension)
+    (32, 64, 16, 8, 8),
+    (128, 64, 16, 8, 8),
+    (256, 64, 16, 8, 8),
     
-    def add_dispatch_entry(self, BM: int, BN: int, BK: int, TM: int, TN: int) -> str:
-        """Generate dispatch macro entry for a parameter combination"""
-        return f"        else DISPATCH_GEMM({BM}, {BN}, {BK}, {TM}, {TN})"
+    # Varying BN (Block N dimension)
+    (64, 32, 16, 8, 8),
+    (64, 128, 16, 8, 8),
+    (64, 256, 16, 8, 8),
     
-    def update_dispatch_table(self, param_sets: List[Tuple[int, int, int, int, int]]):
-        """Update the CUDA file with all parameter combinations in dispatch table"""
-        
-        print(f"Updating dispatch table with {len(param_sets)} configurations...")
-        
-        # Read the original file
-        with open(self.cuda_file, 'r') as f:
-            content = f.read()
-        
-        # Generate dispatch entries
-        dispatch_entries = []
-        for i, (BM, BN, BK, TM, TN) in enumerate(param_sets):
-            if i == 0:
-                # First entry without 'else'
-                entry = f"        DISPATCH_GEMM({BM}, {BN}, {BK}, {TM}, {TN})"
-            else:
-                entry = f"        else DISPATCH_GEMM({BM}, {BN}, {BK}, {TM}, {TN})"
-            dispatch_entries.append(entry)
-        
-        dispatch_block = "\n".join(dispatch_entries)
-        
-        # Find and replace the dispatch section
-        start_marker = "        // Add common configurations here"
-        end_marker = "        else {"
-        
-        start_idx = content.find(start_marker)
-        end_idx = content.find(end_marker, start_idx)
-        
-        if start_idx == -1 or end_idx == -1:
-            raise ValueError("Could not find dispatch table markers in CUDA file")
-        
-        # Replace the dispatch table
-        new_content = (
-            content[:start_idx] +
-            start_marker + "\n" +
-            dispatch_block + "\n" +
-            content[end_idx:]
+    # Varying BK (Block K dimension)
+    (64, 64, 8, 8, 8),
+    (64, 64, 32, 8, 8),
+    (64, 64, 64, 8, 8),
+    
+    # Square block sizes
+    (32, 32, 16, 8, 8),
+    (32, 32, 32, 8, 8),
+    (128, 128, 16, 8, 8),
+    (128, 128, 32, 8, 8),
+    (256, 256, 16, 8, 8),
+    
+    # Rectangular blocks - tall
+    (128, 64, 16, 8, 8),
+    (256, 128, 16, 8, 8),
+    (128, 64, 32, 8, 8),
+    
+    # Rectangular blocks - wide
+    (64, 128, 16, 8, 8),
+    (128, 256, 16, 8, 8),
+    (64, 128, 32, 8, 8),
+    
+    # Varying TM (Thread tile M)
+    (64, 64, 16, 4, 8),
+    (64, 64, 16, 16, 8),
+    (128, 128, 16, 4, 8),
+    (128, 128, 16, 16, 8),
+    
+    # Varying TN (Thread tile N)
+    (64, 64, 16, 8, 4),
+    (64, 64, 16, 8, 16),
+    (128, 128, 16, 8, 4),
+    (128, 128, 16, 8, 16),
+    
+    # Varying both TM and TN
+    (64, 64, 16, 4, 4),
+    (64, 64, 16, 16, 16),
+    (128, 128, 16, 4, 4),
+    (128, 128, 16, 16, 16),
+    
+    # Larger BK values
+    (64, 64, 16, 8, 8),
+    (64, 64, 32, 8, 8),
+    (128, 128, 8, 8, 8),
+    (128, 128, 16, 8, 8),
+    (128, 128, 32, 8, 8),
+    
+    # Mixed configurations optimized for different scenarios
+    (64, 128, 32, 8, 8),
+    (128, 64, 32, 8, 8),
+    (64, 256, 16, 8, 8),
+    (256, 64, 16, 8, 8),
+    
+    # Small thread tiles with large blocks
+    (128, 128, 16, 4, 4),
+    (256, 256, 16, 4, 4),
+    (128, 128, 32, 4, 4),
+    
+    # Large thread tiles with medium blocks
+    (64, 64, 16, 16, 16),
+    (64, 64, 32, 16, 16),
+    (128, 128, 16, 16, 16),
+    
+    # Exploring BK = 8
+    (32, 32, 8, 4, 4),
+    (64, 64, 8, 8, 8),
+    (128, 128, 8, 8, 8),
+    (64, 128, 8, 8, 8),
+    (128, 64, 8, 8, 8),
+    
+    # Higher BK values
+    (32, 32, 64, 8, 8),
+    (64, 64, 64, 8, 8),
+    (128, 128, 64, 8, 8),
+    
+    # Extreme configurations - very large blocks
+    (256, 256, 32, 8, 8),
+    (256, 256, 16, 16, 16),
+    (256, 128, 32, 8, 8),
+    (128, 256, 32, 8, 8),
+    
+    # Asymmetric thread tiles
+    (64, 64, 16, 4, 16),
+    (64, 64, 16, 16, 4),
+    (128, 128, 16, 4, 16),
+    (128, 128, 16, 16, 4),
+    
+    # More BK variations
+    (64, 64, 24, 8, 8),
+    (128, 128, 24, 8, 8),
+    (64, 128, 24, 8, 8),
+    
+    # Small blocks, various configurations
+    (32, 32, 16, 4, 4),
+    (32, 32, 32, 4, 4),
+    (32, 64, 16, 4, 8),
+    (64, 32, 16, 8, 4),
+    (32, 64, 32, 4, 8),
+    (64, 32, 32, 8, 4),
+    
+    # Medium-large blocks
+    (96, 96, 16, 8, 8),
+    (96, 96, 32, 8, 8),
+    (160, 160, 16, 8, 8),
+    (192, 192, 16, 8, 8),
+    
+    # Non-power-of-2 dimensions
+    (80, 80, 16, 8, 8),
+    (96, 64, 16, 8, 8),
+    (64, 96, 16, 8, 8),
+    (80, 96, 16, 8, 8),
+    
+    # Testing thread tile variations with 128x128 blocks
+    (128, 128, 16, 8, 4),
+    (128, 128, 16, 4, 8),
+    (128, 128, 16, 8, 16),
+    (128, 128, 16, 16, 8),
+    
+    # Testing thread tile variations with 64x64 blocks
+    (64, 64, 16, 8, 4),
+    (64, 64, 16, 4, 8),
+    (64, 64, 32, 8, 4),
+    (64, 64, 32, 4, 8),
+    
+    # Large rectangular blocks
+    (256, 64, 16, 16, 8),
+    (64, 256, 16, 8, 16),
+    (256, 64, 32, 16, 8),
+    (64, 256, 32, 8, 16),
+    
+    # Various BK with square blocks
+    (128, 128, 8, 4, 4),
+    (128, 128, 16, 4, 4),
+    (128, 128, 32, 4, 4),
+    (128, 128, 64, 4, 4),
+    
+    # Testing with TM=TN=2
+    (64, 64, 16, 2, 2),
+    (128, 128, 16, 2, 2),
+    (64, 64, 32, 2, 2),
+    
+    # More extreme thread tiles
+    (64, 64, 16, 32, 32),
+    (128, 128, 16, 32, 32),
+    
+    # Balanced medium configurations
+    (96, 96, 16, 4, 4),
+    (96, 96, 16, 8, 8),
+    (96, 96, 24, 8, 8),
+    
+    # More non-square combinations
+    (48, 96, 16, 4, 8),
+    (96, 48, 16, 8, 4),
+    (80, 160, 16, 8, 8),
+    (160, 80, 16, 8, 8),
+]
+
+DIMENSION_CONFIGS = [
+    (8192, 8192, 8192),
+    (8192, 8192, 256)
+]
+
+
+ALL_CONFIGS = list(itertools.product(PARAM_CONFIGS, DIMENSION_CONFIGS))
+
+# Distribute configurations across ranks
+ALL_CONFIGS = [config for i, config in enumerate(ALL_CONFIGS) if i % total_ranks == rank]
+
+def compile_cuda(source_file, output_binary, bm, bn, bk, tm, tn, m, n, k):
+    """Compile CUDA source with specified parameters."""
+    compile_cmd = [
+        'nvcc',
+        '-O3',
+        '-std=c++17',
+        '-arch=sm_90',  # H100
+        f'-D_BM={bm}',
+        f'-D_BN={bn}',
+        f'-D_BK={bk}',
+        f'-D_TM={tm}',
+        f'-D_TN={tn}',
+        f'-D_M={m}',
+        f'-D_N={n}',
+        f'-D_K={k}',
+        '-lcublas',
+        '-Xcompiler', '-fopenmp',
+        source_file,
+        '-o', output_binary
+    ]
+    
+    print(f"Compiling {source_file} with BM={bm}, BN={bn}, BK={bk}, TM={tm}, TN={tn}...")
+    
+    try:
+        result = subprocess.run(compile_cmd, check=True, capture_output=True, text=True)
+        print(f"✓ Compilation successful: {output_binary}")
+        if result.stderr:
+            stderr_lines = result.stderr.strip().split('\n')
+            warnings = [line for line in stderr_lines if 'warning' in line.lower()]
+            if warnings:
+                print(f"  Warnings: {len(warnings)} warning(s)")
+        return True
+    except subprocess.CalledProcessError as e:
+        print(f"✗ Compilation failed!")
+        print(f"  stderr: {e.stderr}")
+        return False
+
+def parse_2d_output(output, m, n, k):
+    """Parse 2D tiled GEMM output - only iterations, no summary."""
+    results = []
+    
+    # Extract parameters
+    param_match = re.search(r'BM=(\d+) BN=(\d+) BK=(\d+) TM=(\d+) TN=(\d+)', output)
+    if not param_match:
+        return results
+    
+    bm, bn, bk, tm, tn = map(int, param_match.groups())
+    
+    # Extract kernel iterations
+    kernel_pattern = r'2D Block-Tiled GEMM.*?: ([\d.]+) ms \((\d+)/\d+\)'
+    for match in re.finditer(kernel_pattern, output):
+        time_ms, iteration = match.groups()
+        results.append({
+            'type': '2D_kernel',
+            'bm': bm, 'bn': bn, 'bk': bk, 'tm': tm, 'tn': tn,
+            'm': m, 'n': n, 'k': k,
+            'iteration': int(iteration),
+            'time_ms': float(time_ms)
+        })
+    
+    # Extract cuBLAS iterations
+    cublas_pattern = r'cuBLAS DGEMM.*?: ([\d.]+) ms \((\d+)/\d+\)'
+    for match in re.finditer(cublas_pattern, output):
+        time_ms, iteration = match.groups()
+        results.append({
+            'type': '2D_cublas',
+            'bm': bm, 'bn': bn, 'bk': bk, 'tm': tm, 'tn': tn,
+            'm': m, 'n': n, 'k': k,
+            'iteration': int(iteration),
+            'time_ms': float(time_ms)
+        })
+    
+    return results
+
+def parse_4d_output(output, m, n, k):
+    """Parse 4D tensor GEMM output - only iterations, no summary."""
+    results = []
+    
+    # Extract parameters
+    param_match = re.search(r'BM=(\d+) BN=(\d+) BK=(\d+) TM=(\d+) TN=(\d+)', output)
+    if not param_match:
+        return results
+    
+    bm, bn, bk, tm, tn = map(int, param_match.groups())
+    
+    # Extract 4D kernel iterations
+    kernel_pattern = r'4D Tensor GEMM.*?: ([\d.]+) ms \((\d+)/\d+\)'
+    for match in re.finditer(kernel_pattern, output):
+        time_ms, iteration = match.groups()
+        results.append({
+            'type': '4D_kernel',
+            'bm': bm, 'bn': bn, 'bk': bk, 'tm': tm, 'tn': tn,
+            'm': m, 'n': n, 'k': k,
+            'iteration': int(iteration),
+            'time_ms': float(time_ms)
+        })
+    
+    # Extract cuBLAS iterations
+    cublas_pattern = r'cuBLAS DGEMM.*?: ([\d.]+) ms \((\d+)/\d+\)'
+    for match in re.finditer(cublas_pattern, output):
+        time_ms, iteration = match.groups()
+        results.append({
+            'type': '4D_cublas',
+            'bm': bm, 'bn': bn, 'bk': bk, 'tm': tm, 'tn': tn,
+            'm': m, 'n': n, 'k': k,
+            'iteration': int(iteration),
+            'time_ms': float(time_ms)
+        })
+    
+    return results
+
+def run_binary(binary_path):
+    """Run compiled binary and capture output."""
+    print(f"Running {binary_path}...")
+    try:
+        result = subprocess.run(
+            [f'./{binary_path}'],
+            check=True,
+            capture_output=True,
+            text=True,
+            timeout=300  # 5 minute timeout
         )
-        
-        # Write back
-        with open(self.cuda_file, 'w') as f:
-            f.write(new_content)
-        
-        print("Dispatch table updated successfully")
-    
-    def compile_kernel(self, arch: str = "sm_80") -> bool:
-        """Compile the CUDA kernel"""
-        
-        output_binary = "gemm_test"
-        compile_cmd = [
-            "nvcc",
-            "-O3",
-            "-Xcompiler", "-fopenmp",
-            "-Xcompiler", "-fPIC",
-            "-Xcompiler", "-O3",
-            f"-arch={arch}",
-            "-o", output_binary,
-            self.cuda_file
-        ]
-        
-        print(f"Compiling with: {' '.join(compile_cmd)}")
-        
-        try:
-            result = subprocess.run(
-                compile_cmd,
-                capture_output=True,
-                text=True,
-                timeout=60
-            )
-            
-            if result.returncode != 0:
-                print(f"Compilation failed:")
-                print(result.stderr)
-                return False
-            
-            print("Compilation successful")
-            return True
-            
-        except subprocess.TimeoutExpired:
-            print("Compilation timeout")
-            return False
-        except Exception as e:
-            print(f"Compilation error: {e}")
-            return False
-    
-    def run_benchmark(self, M: int, N: int, K: int,
-                     BM: int, BN: int, BK: int, TM: int, TN: int,
-                     verify: bool = False) -> Optional[float]:
-        """Run benchmark for specific parameters and return GFLOPS"""
-        
-        binary = "./gemm_test"
-        
-        # Create a simple test program that calls the function
-        test_prog = f"""
-#include <stdio.h>
-#include <cuda_runtime.h>
+        print(f"✓ Execution successful")
+        return result.stdout
+    except subprocess.CalledProcessError as e:
+        print(f"✗ Execution failed!")
+        print(f"  Return code: {e.returncode}")
+        if e.stderr:
+            print(f"  stderr: {e.stderr[:200]}")
+        return None
+    except subprocess.TimeoutExpired:
+        print(f"✗ Execution timed out!")
+        return None
 
-extern "C" double run_gemm_with_params(int M, int N, int K,
-                                       int BM, int BN, int BK, int TM, int TN,
-                                       bool verify_correctness);
+def save_to_csv(results, filename, mode='a'):
+    """Save results to CSV file."""
+    if not results:
+        return
+    
+    # Define explicit field order
+    fieldnames = ['bk', 'bm', 'bn', 'iteration', 'time_ms', 'tm', 'tn', 'type', 'm', 'n', 'k']
+    
+    file_exists = Path(filename).exists()
+    
+    with open(filename, mode, newline='') as csvfile:
+        writer = csv.DictWriter(csvfile, fieldnames=fieldnames, extrasaction='ignore')
+        
+        if not file_exists or mode == 'w':
+            writer.writeheader()
+        
+        for result in results:
+            writer.writerow(result)
+    
+    print(f"✓ Saved {len(results)} results to {filename}")
 
-int main() {{
-    int M = {M}, N = {N}, K = {K};
-    int BM = {BM}, BN = {BN}, BK = {BK}, TM = {TM}, TN = {TN};
+def validate_config(bm, bn, bk, tm, tn):
+    """Validate that configuration is likely to compile and run."""
+    # Check thread count
+    threads_per_block = (bm * bn) // (tm * tn)
+    if threads_per_block > 1024 or threads_per_block <= 0:
+        print(f"  ⚠ Skipping: Invalid thread count {threads_per_block} (must be 1-1024)")
+        return False
     
-    double time_ms = run_gemm_with_params(M, N, K, BM, BN, BK, TM, TN, {str(verify).lower()});
+    # Check shared memory (approximate)
+    smem_size = (bm * bk + bk * bn) * 8  # 8 bytes per double
+    if smem_size > 48 * 1024:
+        print(f"  ⚠ Skipping: Shared memory {smem_size} bytes exceeds 48KB limit")
+        return False
     
-    if (time_ms > 0) {{
-        double gflops = (2.0 * M * N * K) / (time_ms * 1e6);
-        printf("TIME_MS:%.6f\\n", time_ms);
-        printf("GFLOPS:%.2f\\n", gflops);
-        return 0;
-    }} else {{
-        printf("ERROR\\n");
-        return 1;
-    }}
-}}
-"""
-        
-        # Write test program
-        test_file = "test_runner.cu"
-        with open(test_file, 'w') as f:
-            f.write(test_prog)
-        
-        # Compile and run (combining both kernels)
-        compile_cmd = [
-            "nvcc", "-O3", "-arch=sm_80",
-            "-o", "test_runner",
-            test_file, self.cuda_file
-        ]
-        
-        try:
-            # Compile
-            result = subprocess.run(compile_cmd, capture_output=True, text=True, timeout=30)
-            if result.returncode != 0:
-                print(f"  Test compilation failed: {result.stderr[:200]}")
-                return None
-            
-            # Run
-            result = subprocess.run(
-                ["./test_runner"],
-                capture_output=True,
-                text=True,
-                timeout=30
-            )
-            
-            if result.returncode != 0:
-                print(f"  Execution failed")
-                return None
-            
-            # Parse output
-            output = result.stdout
-            time_ms = None
-            gflops = None
-            
-            for line in output.split('\n'):
-                if line.startswith("TIME_MS:"):
-                    time_ms = float(line.split(':')[1])
-                elif line.startswith("GFLOPS:"):
-                    gflops = float(line.split(':')[1])
-            
-            if time_ms is not None and gflops is not None:
-                return gflops
-            else:
-                print(f"  Could not parse output")
-                return None
-                
-        except subprocess.TimeoutExpired:
-            print(f"  Execution timeout")
-            return None
-        except Exception as e:
-            print(f"  Error: {e}")
-            return None
-        finally:
-            # Cleanup
-            for f in ["test_runner", test_file]:
-                if os.path.exists(f):
-                    os.remove(f)
+    # Check divisibility
+    if bm % tm != 0 or bn % tn != 0:
+        print(f"  ⚠ Skipping: BM must be divisible by TM, BN by TN")
+        return False
     
-    def test_configuration(self, M: int, N: int, K: int,
-                          BM: int, BN: int, BK: int, TM: int, TN: int,
-                          verify: bool = False) -> Dict:
-        """Test a single configuration"""
-        
-        result = {
-            'M': M, 'N': N, 'K': K,
-            'BM': BM, 'BN': BN, 'BK': BK,
-            'TM': TM, 'TN': TN,
-            'valid': False,
-            'gflops': None,
-            'threads_per_block': None,
-            'smem_bytes': None,
-            'error': None
-        }
-        
-        # Validate parameters
-        valid, msg = self.validate_params(BM, BN, BK, TM, TN)
-        if not valid:
-            result['error'] = msg
-            return result
-        
-        result['valid'] = True
-        result['threads_per_block'] = (BM * BN) // (TM * TN)
-        result['smem_bytes'] = (BM * BK + BK * BN) * self.DOUBLE_SIZE
-        
-        # Run benchmark
-        gflops = self.run_benchmark(M, N, K, BM, BN, BK, TM, TN, verify)
-        
-        if gflops is not None:
-            result['gflops'] = gflops
-        else:
-            result['error'] = "Execution failed"
-        
-        return result
-    
-    def generate_parameter_space(self) -> List[Tuple[int, int, int, int, int]]:
-        """Generate a reasonable parameter space to explore"""
-        
-        param_sets = []
-        
-        # Common block sizes
-        block_sizes = [64, 128, 256]
-        
-        # K-dimension chunk sizes
-        bk_values = [8, 16]
-        
-        # Thread tile sizes
-        thread_tiles = [4, 8]
-        
-        # Generate combinations
-        for BM in block_sizes:
-            for BN in block_sizes:
-                for BK in bk_values:
-                    for TM in thread_tiles:
-                        for TN in thread_tiles:
-                            valid, _ = self.validate_params(BM, BN, BK, TM, TN)
-                            if valid:
-                                param_sets.append((BM, BN, BK, TM, TN))
-        
-        # Also add some rectangular blocks
-        rectangular = [
-            (128, 64, 8, 8, 8),
-            (64, 128, 8, 8, 8),
-            (256, 128, 8, 8, 8),
-            (128, 256, 8, 8, 8),
-        ]
-        
-        for params in rectangular:
-            valid, _ = self.validate_params(*params)
-            if valid and params not in param_sets:
-                param_sets.append(params)
-        
-        return param_sets
-    
-    def run_tuning(self, M: int = 4096, N: int = 4096, K: int = 4096,
-                   verify_first: bool = True):
-        """Run autotuning across parameter space"""
-        
-        print(f"\n{'='*70}")
-        print(f"GEMM Autotuner - Matrix size: {M}x{N}x{K}")
-        print(f"{'='*70}\n")
-        
-        # Generate parameter space
-        param_sets = self.generate_parameter_space()
-        print(f"Testing {len(param_sets)} parameter combinations\n")
-        
-        # Update dispatch table with all combinations
-        self.update_dispatch_table(param_sets)
-        
-        # Compile once with all configurations
-        if not self.compile_kernel():
-            print("Failed to compile kernel")
-            return
-        
-        print(f"\n{'='*70}")
-        print("Running benchmarks...")
-        print(f"{'='*70}\n")
-        
-        # Test each configuration
-        for i, (BM, BN, BK, TM, TN) in enumerate(param_sets):
-            print(f"[{i+1}/{len(param_sets)}] Testing BM={BM:3d} BN={BN:3d} BK={BK:2d} TM={TM:2d} TN={TN:2d} ... ", end='', flush=True)
-            
-            # Verify first configuration
-            verify = verify_first and i == 0
-            
-            result = self.test_configuration(M, N, K, BM, BN, BK, TM, TN, verify)
-            
-            if result['gflops'] is not None:
-                print(f"{result['gflops']:7.2f} GFLOPS")
-            else:
-                print(f"FAILED - {result.get('error', 'Unknown error')}")
-            
-            self.results.append(result)
-        
-        # Save results
-        self.save_results()
-        
-        # Print summary
-        self.print_summary()
-    
-    def save_results(self):
-        """Save results to JSON and CSV files"""
-        
-        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-        
-        # Save JSON
-        json_file = os.path.join(self.output_dir, f"results_{timestamp}.json")
-        with open(json_file, 'w') as f:
-            json.dump(self.results, f, indent=2)
-        print(f"\nResults saved to: {json_file}")
-        
-        # Save CSV
-        csv_file = os.path.join(self.output_dir, f"results_{timestamp}.csv")
-        if self.results:
-            keys = self.results[0].keys()
-            with open(csv_file, 'w', newline='') as f:
-                writer = csv.DictWriter(f, fieldnames=keys)
-                writer.writeheader()
-                writer.writerows(self.results)
-            print(f"Results saved to: {csv_file}")
-    
-    def print_summary(self):
-        """Print summary of results"""
-        
-        successful = [r for r in self.results if r['gflops'] is not None]
-        
-        if not successful:
-            print("\nNo successful runs!")
-            return
-        
-        print(f"\n{'='*70}")
-        print("SUMMARY")
-        print(f"{'='*70}")
-        print(f"Total configurations tested: {len(self.results)}")
-        print(f"Successful runs: {len(successful)}")
-        print(f"Failed runs: {len(self.results) - len(successful)}")
-        
-        # Sort by performance
-        successful.sort(key=lambda x: x['gflops'], reverse=True)
-        
-        print(f"\n{'='*70}")
-        print("TOP 10 CONFIGURATIONS")
-        print(f"{'='*70}")
-        print(f"{'Rank':<6} {'BM':<5} {'BN':<5} {'BK':<5} {'TM':<5} {'TN':<5} {'GFLOPS':<10} {'Threads':<8} {'SMEM(KB)'}")
-        print(f"{'-'*70}")
-        
-        for i, result in enumerate(successful[:10]):
-            print(f"{i+1:<6} "
-                  f"{result['BM']:<5} "
-                  f"{result['BN']:<5} "
-                  f"{result['BK']:<5} "
-                  f"{result['TM']:<5} "
-                  f"{result['TN']:<5} "
-                  f"{result['gflops']:<10.2f} "
-                  f"{result['threads_per_block']:<8} "
-                  f"{result['smem_bytes']/1024:.1f}")
-        
-        # Best configuration
-        best = successful[0]
-        print(f"\n{'='*70}")
-        print("BEST CONFIGURATION:")
-        print(f"  BM={best['BM']}, BN={best['BN']}, BK={best['BK']}, TM={best['TM']}, TN={best['TN']}")
-        print(f"  Performance: {best['gflops']:.2f} GFLOPS")
-        print(f"  Threads per block: {best['threads_per_block']}")
-        print(f"  Shared memory: {best['smem_bytes']/1024:.1f} KB")
-        print(f"{'='*70}\n")
-
+    return True
 
 def main():
-    """Main entry point"""
-    
-    import argparse
-    
-    parser = argparse.ArgumentParser(description='GEMM Tiling Parameter Autotuner')
-    parser.add_argument('--M', type=int, default=4096, help='Matrix M dimension')
-    parser.add_argument('--N', type=int, default=4096, help='Matrix N dimension')
-    parser.add_argument('--K', type=int, default=4096, help='Matrix K dimension')
-    parser.add_argument('--cuda-file', type=str, default='gemm_fp64_2d_tiled.cu',
-                       help='CUDA source file')
-    parser.add_argument('--output-dir', type=str, default='tuning_results',
-                       help='Output directory for results')
-    parser.add_argument('--no-verify', action='store_true',
-                       help='Skip correctness verification')
-    
-    args = parser.parse_args()
-    
-    # Create autotuner
-    autotuner = GEMMAutotuner(
-        cuda_file=args.cuda_file,
-        output_dir=args.output_dir
-    )
-    
-    # Run tuning
-    autotuner.run_tuning(
-        M=args.M,
-        N=args.N,
-        K=args.K,
-        verify_first=not args.no_verify
-    )
+    timestamp = datetime.now().strftime('%Y%m%d_%H%M%S')
+    csv_2d = f'results_2d_rank{rank}_{timestamp}.csv'
+    csv_4d = f'results_4d_rank{rank}_{timestamp}.csv'
 
+    print("="*80)
+    print("CUDA GEMM Benchmark Suite - Extended Parameter Sweep")
+    print(f"Total configurations to test: {len(ALL_CONFIGS)}")
+    print("="*80)
+    
+    # Initialize CSV files with headers
+    save_to_csv([], csv_2d, mode='w')
+    save_to_csv([], csv_4d, mode='w')
+    
+    successful_configs = 0
+    failed_configs = 0
+    skipped_configs = 0
+    
+    for idx, ((bm, bn, bk, tm, tn), (m, n, k)) in enumerate(ALL_CONFIGS, 1):
+        print(f"\n{'='*80}")
+        print(f"Configuration {idx}/{len(ALL_CONFIGS)}")
+        print(f"Dimensions: M={m}, N={n}, K={k}")
+        print(f"Parameters: BM={bm}, BN={bn}, BK={bk}, TM={tm}, TN={tn}")
+        print(f"{'='*80}")
+        
+        # Validate configuration before attempting compilation
+        if not validate_config(bm, bn, bk, tm, tn):
+            skipped_configs += 1
+            continue
+        
+        config_success = True
+        
+        # Compile and run 2D version
+        binary_2d = f'gemm_2d_m{m}_n{n}_k{k}_bm{bm}_bn{bn}_bk{bk}_tm{tm}_tn{tn}_m{m}_n{n}_k{k}'
+        if compile_cuda('gemm_fp64_2d_tiled.cu', binary_2d, bm, bn, bk, tm, tn, m, n, k):
+            output_2d = run_binary(binary_2d)
+            if output_2d:
+                results_2d = parse_2d_output(output_2d, m, n, k)
+                if results_2d:
+                    save_to_csv(results_2d, csv_2d, mode='a')
+                    print(f"✓ Parsed {len(results_2d)} data points from 2D output")
+                else:
+                    print("✗ Failed to parse 2D output")
+                    config_success = False
+            else:
+                config_success = False
+        else:
+            config_success = False
+        
+        # Compile and run 4D version
+        binary_4d = f'gemm_4d_m{m}_n{n}_k{k}_bm{bm}_bn{bn}_bk{bk}_tm{tm}_tn{tn}_m{m}_n{n}_k{k}'
+        if compile_cuda('gemm_fp64_4d_storage.cu', binary_4d, bm, bn, bk, tm, tn, m, n, k):
+            output_4d = run_binary(binary_4d)
+            if output_4d:
+                results_4d = parse_4d_output(output_4d, m, n, k)
+                if results_4d:
+                    save_to_csv(results_4d, csv_4d, mode='a')
+                    print(f"✓ Parsed {len(results_4d)} data points from 4D output")
+                else:
+                    print("✗ Failed to parse 4D output")
+                    config_success = False
+            else:
+                config_success = False
+        else:
+            config_success = False
+        
+        if config_success:
+            successful_configs += 1
+        else:
+            failed_configs += 1
+        
+        print(f"\nProgress: {idx}/{len(ALL_CONFIGS)} | Success: {successful_configs} | Failed: {failed_configs} | Skipped: {skipped_configs}")
+    
+    # Clean up generated binaries
+    cleanup_binaries()
+    
+    print(f"\n{'='*80}")
+    print("Benchmark Complete!")
+    print(f"{'='*80}")
+    print(f"Total configurations: {len(ALL_CONFIGS)}")
+    print(f"Successful: {successful_configs}")
+    print(f"Failed: {failed_configs}")
+    print(f"Skipped: {skipped_configs}")
+    print(f"\nResults saved to:")
+    print(f"  - {csv_2d}")
+    print(f"  - {csv_4d}")
+    print(f"{'='*80}")
 
-if __name__ == "__main__":
+def cleanup_binaries():
+    """Remove all generated binary files."""
+    print("\nCleaning up generated binaries...")
+    
+    # Find all generated binaries
+    patterns = ['gemm_2d_*', 'gemm_4d_*']
+    removed_count = 0
+    
+    for pattern in patterns:
+        binaries = glob.glob(pattern)
+        for binary in binaries:
+            try:
+                Path(binary).unlink()
+                removed_count += 1
+            except Exception as e:
+                print(f"  Warning: Could not remove {binary}: {e}")
+    
+    print(f"✓ Removed {removed_count} binary files")
+
+if __name__ == '__main__':
     main()
