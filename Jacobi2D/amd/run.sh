@@ -6,7 +6,7 @@
 #SBATCH --cpus-per-task=256
 #SBATCH --exclusive
 #SBATCH --mem=0
-#SBATCH --time=03:00:00
+#SBATCH --time=04:00:00
 #SBATCH --output=logs/%x_%j.out
 #SBATCH --error=logs/%x_%j.err
 
