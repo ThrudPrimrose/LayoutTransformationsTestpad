@@ -152,7 +152,7 @@ def run_mpi(n, tsteps, px, py):
     """Run MPI implementation."""
     nprocs = px * py
     cmd = [
-        "mpirun", "--oversubscribe", "-np", str(nprocs),
+        "mpirun", "--use-hwthread-cpus", "-np", str(nprocs),
         MPI_EXE, str(n), str(n), str(px), str(py), str(tsteps)
     ]
     return run_command(cmd)

@@ -1,214 +1,352 @@
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include <math.h>
 #include <omp.h>
-#include <cstdio>
-#include <cstdlib>
-#include <cstring>
-#include <cmath>
 
-#ifdef PAPI_ENABLED
-#include "papi_metrics.h"
-#endif
+#define MAX(a,b) ((a) > (b) ? (a) : (b))
+#define MIN(a,b) ((a) < (b) ? (a) : (b))
 
+// Alignment in bytes (cache line size)
+#define ALIGN_BYTES 64
+#define ALIGN_DOUBLES (ALIGN_BYTES / sizeof(double))  // 8 doubles
 
-// Baseline Jacobi2D with row-major data and OpenMP parallelization
-class Jacobi2DBoundary {
-public:
-    int N;        // Interior size
-    double *__restrict__ A;
-    double *__restrict__ B;
+// Round up to multiple of ALIGN_DOUBLES
+#define ALIGN_UP(x) (((x) + ALIGN_DOUBLES - 1) / ALIGN_DOUBLES * ALIGN_DOUBLES)
 
-    // Boundary arrays (contiguous storage) - boundaries are at index 0 and N+1
-    double *__restrict__ A_top;      // Row 0
-    double *__restrict__ A_bottom;   // Row N+1
-    double *__restrict__ A_left;     // Column 0
-    double *__restrict__ A_right;    // Column N+1
-    double *__restrict__ B_top;
-    double *__restrict__ B_bottom;
-    double *__restrict__ B_left;
-    double *__restrict__ B_right;
+/*
+ * SoA Block Layout with 64-byte alignment:
+ * -----------------------------------------
+ * Each local position (lj, li) has an array of BM*BN block values.
+ * We pad num_blocks to a multiple of 8 (64 bytes / 8 bytes per double)
+ * so each position's block array starts at a 64-byte boundary.
+ * 
+ * offset(bi, bj, lj, li) = (lj * BW_halo + li) * num_blocks_padded + bi * BN + bj
+ */
 
-    Jacobi2DBoundary(int size) : N(size) {
-        A = new double[N * N];
-        B = new double[N * N];
-        
-        // Allocate boundary arrays
-        A_top = new double[(N)];
-        A_bottom = new double[(N)];
-        A_left = new double[(N)];
-        A_right = new double[(N)];
-        B_top = new double[(N)];
-        B_bottom = new double[(N)];
-        B_left = new double[(N)];
-        B_right = new double[(N)];
+typedef struct {
+    int N;                    // Interior grid size (N x N)
+    int BM, BN;               // Number of blocks in y and x
+    int BH, BW;               // Interior size of each block (without halo)
+    int BH_halo, BW_halo;     // Block size with halo (BH+2, BW+2)
+    int num_blocks;           // BM * BN (actual)
+    int num_blocks_padded;    // Padded to multiple of ALIGN_DOUBLES for 64-byte alignment
+    int positions_per_block;  // BH_halo * BW_halo
+    int total_size;           // Total array size (with padding)
+    double *A;
+    double *B;
+} Jacobi2DSoA;
+
+// SoA offset with alignment padding
+static inline int soa_offset(const Jacobi2DSoA *s, int bi, int bj, int lj, int li) {
+    return (lj * s->BW_halo + li) * s->num_blocks_padded + bi * s->BN + bj;
+}
+
+// Convert global (j, i) to block indices and local coordinates
+static inline void global_to_block_local(const Jacobi2DSoA *s, int j, int i,
+                                         int *bi, int *bj, int *lj, int *li) {
+    if (j <= 0) {
+        *bi = 0;
+        *lj = 0;
+    } else if (j > s->N) {
+        *bi = s->BM - 1;
+        *lj = s->BH + 1;
+    } else {
+        *bi = (j - 1) / s->BH;
+        if (*bi >= s->BM) *bi = s->BM - 1;
+        *lj = (j - 1) - (*bi) * s->BH + 1;
     }
     
-    ~Jacobi2DBoundary() {
-        delete[] A;
-        delete[] B;
-        delete[] A_top;
-        delete[] A_bottom;
-        delete[] A_left;
-        delete[] A_right;
-        delete[] B_top;
-        delete[] B_bottom;
-        delete[] B_left;
-        delete[] B_right;
+    if (i <= 0) {
+        *bj = 0;
+        *li = 0;
+    } else if (i > s->N) {
+        *bj = s->BN - 1;
+        *li = s->BW + 1;
+    } else {
+        *bj = (i - 1) / s->BW;
+        if (*bj >= s->BN) *bj = s->BN - 1;
+        *li = (i - 1) - (*bj) * s->BW + 1;
     }
+}
 
-    void initialize() {
-        #pragma omp parallel for
-        for (int i = 1; i < (N+1); i++) {
-            #pragma omp simd
-            for (int j = 1; j < (N+1); j++) {
-                A[(i-1) * (N) + (j-1)] = (double)(i * (j + 2)) / N;
-                B[(i-1) * (N) + (j-1)] = (double)(i * (j + 3)) / N;
+static inline double soa_get(const Jacobi2DSoA *__restrict__ s, const double *__restrict__ arr, const int j, const int i) {
+    int bi, bj, lj, li;
+    global_to_block_local(s, j, i, &bi, &bj, &lj, &li);
+    return arr[soa_offset(s, bi, bj, lj, li)];
+}
+
+static inline void soa_set(const Jacobi2DSoA *__restrict__ s, double *__restrict__ arr, const int j, const int i, const double val) {
+    int bi, bj, lj, li;
+    global_to_block_local(s, j, i, &bi, &bj, &lj, &li);
+    arr[soa_offset(s, bi, bj, lj, li)] = val;
+}
+
+void jacobi_init(Jacobi2DSoA *__restrict__ s, const int N, const int BM, const int BN) {
+    s->N = N;
+    s->BM = BM;
+    s->BN = BN;
+    
+    s->BH = (N + BM - 1) / BM;
+    s->BW = (N + BN - 1) / BN;
+    s->BH_halo = s->BH + 2;
+    s->BW_halo = s->BW + 2;
+    s->num_blocks = BM * BN;
+    
+    // Pad num_blocks to multiple of 8 for 64-byte alignment
+    s->num_blocks_padded = ALIGN_UP(s->num_blocks);
+    
+    s->positions_per_block = s->BH_halo * s->BW_halo;
+    s->total_size = s->positions_per_block * s->num_blocks_padded;
+    
+    // Allocate with 64-byte alignment
+    s->A = (double*)aligned_alloc(ALIGN_BYTES, s->total_size * sizeof(double));
+    s->B = (double*)aligned_alloc(ALIGN_BYTES, s->total_size * sizeof(double));
+    
+    if (!s->A || !s->B) {
+        fprintf(stderr, "Failed to allocate aligned memory\n");
+        exit(1);
+    }
+    
+    // Zero out (including padding)
+    memset(s->A, 0, s->total_size * sizeof(double));
+    memset(s->B, 0, s->total_size * sizeof(double));
+    
+    printf("Alignment info:\n");
+    printf("  num_blocks = %d, num_blocks_padded = %d\n", s->num_blocks, s->num_blocks_padded);
+    printf("  Block size with halo: %d x %d = %d positions\n", 
+           s->BH_halo, s->BW_halo, s->positions_per_block);
+    printf("  Total array size: %d doubles (%.2f MB)\n", 
+           s->total_size, s->total_size * sizeof(double) / (1024.0 * 1024.0));
+    printf("  Each position's block array: %d doubles = %lu bytes (64-byte aligned: %s)\n",
+           s->num_blocks_padded, s->num_blocks_padded * sizeof(double),
+           (s->num_blocks_padded * sizeof(double)) % 64 == 0 ? "yes" : "no");
+}
+
+void jacobi_free(Jacobi2DSoA *__restrict__ s) {
+    free(s->A);
+    free(s->B);
+}
+
+void jacobi_initialize_data(Jacobi2DSoA *__restrict__ s) {
+    int N = s->N;
+    
+    #pragma omp parallel for collapse(2) schedule(static)
+    for (int j = 0; j <= N + 1; j++) {
+        for (int i = 0; i <= N + 1; i++) {
+            soa_set(s, s->A, j, i, (double)(j * (i + 2)) / N);
+            soa_set(s, s->B, j, i, (double)(j * (i + 3)) / N);
+        }
+    }
+}
+
+// Synchronize halos between adjacent blocks
+void sync_halos(Jacobi2DSoA *__restrict__ s, double *__restrict__ arr) {
+    int BM = s->BM;
+    int BN = s->BN;
+    int BH = s->BH;
+    int BW = s->BW;
+    int num_blocks_padded = s->num_blocks_padded;
+    int BW_halo = s->BW_halo;
+    
+    #pragma omp parallel for schedule(static)
+    for (int bi = 0; bi < BM; bi++) {
+        for (int bj = 0; bj < BN; bj++) {
+            // North halo (lj = 0)
+            if (bi > 0) {
+                #pragma omp simd
+                for (int li = 1; li <= BW; li++) {
+                    int src_off = (BH * BW_halo + li) * num_blocks_padded + (bi - 1) * BN + bj;
+                    int dst_off = (0 * BW_halo + li) * num_blocks_padded + bi * BN + bj;
+                    arr[dst_off] = arr[src_off];
+                }
+            }
+            
+            // South halo (lj = BH+1)
+            if (bi < BM - 1) {
+                #pragma omp simd
+                for (int li = 1; li <= BW; li++) {
+                    int src_off = (1 * BW_halo + li) * num_blocks_padded + (bi + 1) * BN + bj;
+                    int dst_off = ((BH + 1) * BW_halo + li) * num_blocks_padded + bi * BN + bj;
+                    arr[dst_off] = arr[src_off];
+                }
+            }
+            
+            // West halo (li = 0)
+            if (bj > 0) {
+                #pragma omp simd
+                for (int lj = 1; lj <= BH; lj++) {
+                    int src_off = (lj * BW_halo + BW) * num_blocks_padded + bi * BN + (bj - 1);
+                    int dst_off = (lj * BW_halo + 0) * num_blocks_padded + bi * BN + bj;
+                    arr[dst_off] = arr[src_off];
+                }
+            }
+            
+            // East halo (li = BW+1)
+            if (bj < BN - 1) {
+                #pragma omp simd
+                for (int lj = 1; lj <= BH; lj++) {
+                    int src_off = (lj * BW_halo + 1) * num_blocks_padded + bi * BN + (bj + 1);
+                    int dst_off = (lj * BW_halo + BW + 1) * num_blocks_padded + bi * BN + bj;
+                    arr[dst_off] = arr[src_off];
+                }
             }
         }
-        
-        #pragma omp parallel for
-        // Initialize boundaries
-        for (int j = 1; j <= N; j++) {
-            // Note: j is in logical coordinates [1..N]
-            A_top[j-1]    = (double)(0 * (j + 2)) / N;
-            A_bottom[j-1] = (double)((N + 1) * (j + 2)) / N;
-            B_top[j-1] = (double)(0 * (j + 3)) / N;
-            B_bottom[j-1] = (double)((N + 1) * (j + 3)) / N;
-        }
-
-        #pragma omp parallel for
-        for (int i = 1; i <= N; i++) {
-            // Note: i is in logical coordinates [1..N]
-            A_left[i-1]   = (double)(i * (0 + 2)) / N;
-            A_right[i-1]  = (double)(i * (N + 1 + 2)) / N;
-            B_left[i-1] = (double)(i * (0 + 3)) / N;
-            B_right[i-1] = (double)(i * (N + 1 + 3)) / N;
-        }
     }
+}
 
-    inline double get_value(double *interior, double *top, double *bottom, 
-                        double *left, double *right, int i, int j) {
-        // i, j are in logical coordinates [1..N] (inclusive)
-        if (i == 0) return top[j-1];        // Convert j from [1..N] to [0..N-1]
-        if (i == N+1) return bottom[j-1];   // Same conversion
-        if (j == 0) return left[i-1];       // Convert i from [1..N] to [0..N-1]
-        if (j == N+1) return right[i-1];    // Same conversion
-        
-        // Interior: convert to [0..N-1] indexing
-        return interior[(i - 1) * N + (j - 1)];
-    }
+// Jacobi iteration kernel with alignment hints for vectorization
+void jacobi_iteration(double * __restrict__ in, double * __restrict__ out, Jacobi2DSoA *s) {
+    const int BM = s->BM;
+    const int BN = s->BN;
+    const int BH = s->BH;
+    const int BW = s->BW;
+    const int N = s->N;
+    const int num_blocks_padded = s->num_blocks_padded;
+    const int BW_halo = s->BW_halo;
+    const int num_blocks = s->num_blocks;
+    
+    // Parallel loop over local positions within blocks
+    // This allows vectorization across blocks at the same position
+    #pragma omp parallel for schedule(static)
+    for (int lj = 1; lj <= BH; lj++) {
+        for (int li = 1; li <= BW; li++) {
+            // Base offset for this local position across all blocks
+            int base_c = (lj * BW_halo + li) * num_blocks_padded;
+            int base_l = (lj * BW_halo + (li - 1)) * num_blocks_padded;
+            int base_r = (lj * BW_halo + (li + 1)) * num_blocks_padded;
+            int base_u = ((lj - 1) * BW_halo + li) * num_blocks_padded;
+            int base_d = ((lj + 1) * BW_halo + li) * num_blocks_padded;
+            
+            // Pointers to aligned arrays for this position
+            double * __restrict__ p_out = out + base_c;
+            const double * __restrict__ p_c = in + base_c;
+            const double * __restrict__ p_l = in + base_l;
+            const double * __restrict__ p_r = in + base_r;
+            const double * __restrict__ p_u = in + base_u;
+            const double * __restrict__ p_d = in + base_d;
 
-    void run_iteration(double *in, double *out,
-                      double *in_top, double *in_bottom,
-                      double *in_left, double *in_right) {
-        // Compute interior points [1..N] in logical coordinates
-        #pragma omp parallel for
-        for (int i = 1; i <= N; i++) {
+            // Vectorized loop across all blocks
+            // Only process valid blocks (not padding)
             #pragma omp simd
-            for (int j = 1; j <= N; j++) {
-                double center = get_value(in, in_top, in_bottom, in_left, in_right, i, j);
-                double left_val = get_value(in, in_top, in_bottom, in_left, in_right, i, j - 1);
-                double right_val = get_value(in, in_top, in_bottom, in_left, in_right, i, j + 1);
-                double top_val = get_value(in, in_top, in_bottom, in_left, in_right, i - 1, j);
-                double bottom_val = get_value(in, in_top, in_bottom, in_left, in_right, i + 1, j);
+            for (int b = 0; b < num_blocks; b++) {
+                p_out[b] = 0.2 * (p_c[b] + p_l[b] + p_r[b] + p_u[b] + p_d[b]);
+            }
+        }
+    }
+    
+    // Handle edge cases: blocks that extend beyond N
+    // For blocks at the boundary, some local positions may be outside the domain
+    #pragma omp parallel for collapse(2) schedule(static)
+    for (int bi = 0; bi < BM; bi++) {
+        for (int bj = 0; bj < BN; bj++) {
+            int global_j_end = (bi + 1) * BH;
+            int global_i_end = (bj + 1) * BW;
+            
+            // If this block extends beyond N, zero out the invalid interior points
+            if (global_j_end > N || global_i_end > N) {
+                for (int lj = 1; lj <= BH; lj++) {
+                    int global_j = bi * BH + lj;
+                    if (global_j > N) {
+                        #pragma omp simd
+                        for (int li = 1; li <= BW; li++) {
+                            out[soa_offset(s, bi, bj, lj, li)] = 0.0;
+                        }
+                    } else {
+                        #pragma omp simd
+                        for (int li = 1; li <= BW; li++) {
+                            int global_i = bj * BW + li;
+                            if (global_i > N) {
+                                out[soa_offset(s, bi, bj, lj, li)] = 0.0;
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+}
+
+double jacobi_run(Jacobi2DSoA *__restrict__ s, int tsteps) {
+    double start = omp_get_wtime();
+    
+    double *__restrict__ curr = s->A;
+    double *__restrict__ next = s->B;
+    
+    for (int t = 0; t < tsteps; t++) {
+        sync_halos(s, curr);
+        jacobi_iteration(curr, next, s);
+        
+        double *__restrict__ tmp = curr;
+        curr = next;
+        next = tmp;
+    }
+    
+    if (curr != s->A) {
+        double *tmp = s->A;
+        s->A = s->B;
+        s->B = tmp;
+    }
+    
+    double end = omp_get_wtime();
+    return end - start;
+}
+
+double jacobi_checksum(Jacobi2DSoA *s) {
+    int N = s->N;
+    int BM = s->BM;
+    int BN = s->BN;
+    int BH = s->BH;
+    int BW = s->BW;
+    double sum = 0.0;
+    
+    #pragma omp parallel for collapse(2) reduction(+:sum) schedule(static)
+    for (int bi = 0; bi < BM; bi++) {
+        for (int bj = 0; bj < BN; bj++) {
+            for (int lj = 1; lj <= BH; lj++) {
+                int global_j = bi * BH + lj;
+                if (global_j > N) continue;
                 
-                out[(i - 1) * N + (j - 1)] = 0.2 * (center + left_val + right_val + top_val + bottom_val);
+                for (int li = 1; li <= BW; li++) {
+                    int global_i = bj * BW + li;
+                    if (global_i > N) continue;
+                    
+                    sum += s->A[soa_offset(s, bi, bj, lj, li)];
+                }
             }
         }
-    }
-
-    double run(int tsteps) {
-        double start = omp_get_wtime();
-            
-        double *__restrict__ curr = A;
-        double *__restrict__ next = B;
-
-        for (int t = 0; t < tsteps; t++) {
-            // Use curr's boundaries (but they should be identical anyway)
-            if (curr == A) {
-                run_iteration(curr, next, A_top, A_bottom, A_left, A_right);
-            } else {
-                run_iteration(curr, next, B_top, B_bottom, B_left, B_right);
-            }
-            
-            // Swap ONLY interior
-            double *__restrict__ tmp = curr;
-            curr = next;
-            next = tmp;
-        }
-
-
-        double end = omp_get_wtime();
-        return end - start;
     }
     
-    double checksum() {
-        double sum = 0.0;
-        #pragma omp parallel for reduction(+:sum)
-        for (int i = 0; i < (N); i++) {
-            #pragma omp simd
-            for (int j = 0; j < (N); j++) {
-                sum += A[i * (N) + j];
-            }
-        }
-        return sum;
-    }
-    
-
-};
+    return sum;
+}
 
 int main(int argc, char **argv) {
     int N = 2048;
     int tsteps = 100;
     int num_threads = omp_get_max_threads();
+    int BM = 4;
+    int BN = 4;
     
     if (argc > 1) N = atoi(argv[1]);
     if (argc > 2) tsteps = atoi(argv[2]);
-    if (argc > 3) {
-        num_threads = atoi(argv[3]);
-        omp_set_num_threads(num_threads);
-    }
+    if (argc > 3) BM = atoi(argv[3]);
+    if (argc > 4) BN = atoi(argv[4]);
     
-    printf("Jacobi2D Boundary\n");
-    printf("N=%d, tsteps=%d, threads=%d\n", N, tsteps, num_threads);
-
-    #ifdef PAPI_ENABLED
-    const char* papi_metric = getenv("PAPI_METRIC");
-    init_papi(papi_metric);
-    #pragma omp parallel 
-    {
-        #pragma omp critical 
-        {
-            start_papi_thread();
-        }
-    }
-    #endif
-
-    Jacobi2DBoundary solver(N);
-    solver.initialize();
-    double time = solver.run(tsteps);
-    double checksum = solver.checksum();
-
-    #ifdef PAPI_ENABLED
-    #pragma omp parallel 
-    {
-        #pragma omp critical 
-        {
-            stop_papi_thread();
-        }
-    }
-    // Print PAPI results
-    long long total_count = 0;
-    printf("\nPAPI Results (%s):\n", papi_metric);
-    for (int i = 0; i < num_threads; i++) {
-        printf("  Thread %d: %lld\n", i, g_papi_values[i]);
-        total_count += g_papi_values[i];
-    }
-    printf("  Total: %lld\n", total_count);
-    printf("  Per iteration: %.2f\n", (double)total_count / tsteps);
-    #endif
-
+    printf("Jacobi2D OpenMP with SoA Block-Contiguous Storage (64-byte aligned)\n");
+    printf("N=%d, tsteps=%d, threads=%d, blocks=%dx%d\n", N, tsteps, num_threads, BM, BN);
+    
+    Jacobi2DSoA solver;
+    jacobi_init(&solver, N, BM, BN);
+    jacobi_initialize_data(&solver);
+    
+    double time = jacobi_run(&solver, tsteps);
+    double checksum = jacobi_checksum(&solver);
+    
     printf("Time: %.6f seconds\n", time);
     printf("Checksum: %.10e\n", checksum);
     printf("GFLOPS: %.3f\n", (double)N * N * tsteps * 6 / time / 1e9);
+    
+    jacobi_free(&solver);
     
     return 0;
 }
