@@ -15,7 +15,7 @@ import re
 
 # Configuration
 N = 16384
-TSTEPS = 200
+TSTEPS = 100
 NUM_RUNS = 20
 NUM_THREADS = int(os.environ["OMP_NUM_THREADS"])
 

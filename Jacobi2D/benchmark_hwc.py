@@ -15,9 +15,9 @@ from itertools import product
 import re
 
 # Configuration
-N = 1024
-TSTEPS = 200
-NUM_RUNS = 1  # Changed from 20 to 10 for PAPI runs
+N = 16384
+TSTEPS = 100
+NUM_RUNS = 10
 NUM_THREADS = int(os.environ.get("OMP_NUM_THREADS", "128"))
 
 # Output CSV file
