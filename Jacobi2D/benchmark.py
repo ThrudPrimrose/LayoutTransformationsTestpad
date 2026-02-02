@@ -14,7 +14,7 @@ from itertools import product
 import re
 
 # Configuration
-N = 8192
+N = 16384
 TSTEPS = 200
 NUM_RUNS = 20
 NUM_THREADS = int(os.environ["OMP_NUM_THREADS"])
@@ -32,7 +32,7 @@ MPI_EXE = "./jacobi2d_mpi"
 # Block configurations for OpenMP blocked version: (BM, BN)
 
 # Num cores = 128
-NUM_CORES = 128
+NUM_CORES = int(os.environ.get("OMP_NUM_THREADS", "128"))
 
 BLOCK_CONFIGS = [(u, v) for (u, v) in {
     (1, 1),
@@ -57,6 +57,8 @@ BLOCK_CONFIGS = [(u, v) for (u, v) in {
     (32, 4),
     (32, 8),
     (8, 32),
+    (64, 64),
+    (128, 128)
 } if u * v >= NUM_CORES
 ]
 
@@ -82,6 +84,14 @@ MPI_CONFIGS = [(u, v) for (u, v) in {
     (2, 64),
     (4, 32),
     (32, 4),
+    (6, 6),
+    (4, 9), (9, 4),
+    (3, 12), (12, 3),
+    (2, 18), (18, 2),
+    (1, 36), (36, 1),
+    (4, 9), (9, 4)
+    (3, 12), (12, 3)
+    (6, 8), (8, 6)
 } if u * v == NUM_CORES
 ]
 
@@ -153,7 +163,7 @@ def run_mpi(n, tsteps, px, py):
     nprocs = px * py
     cmd = [
         "mpirun", "--use-hwthread-cpus", "-np", str(nprocs),
-        MPI_EXE, str(n), str(n), str(px), str(py), str(tsteps)
+        MPI_EXE, str(n), str(px), str(py), str(tsteps)
     ]
     return run_command(cmd)
 
@@ -246,6 +256,7 @@ def main():
                     print(f"  Run {run_id+1:2d}/{NUM_RUNS}: FAILED")
         
         # Run blocked (SoA) configurations
+
         if available['blocked']:
             for bm, bn in BLOCK_CONFIGS:
                 # Skip if block size doesn't divide N evenly
@@ -299,10 +310,10 @@ def main():
                         'checksum': checksum,
                         'gflops': gflops
                     }
-                    
+
                     writer.writerow(row)
                     csvfile.flush()
-                    
+
                     if time_val:
                         print(f"  Run {run_id+1:2d}/{NUM_RUNS}: time={time_val:.4f}s, GFLOPS={gflops:.2f}, checksum={checksum}")
                     else:
