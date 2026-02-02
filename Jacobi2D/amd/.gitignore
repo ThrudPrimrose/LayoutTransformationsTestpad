@@ -6,3 +6,5 @@ compile_all*.sh
 *.h
 logs
 results
+
+!*.csv
