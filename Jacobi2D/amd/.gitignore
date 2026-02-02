@@ -1,0 +1,10 @@
+*.cpp
+*.py
+run_all.sh
+submit_jobs.sh
+compile_all*.sh
+*.h
+logs
+results
+
+!*.csv

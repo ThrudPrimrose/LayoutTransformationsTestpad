@@ -15,7 +15,7 @@ import re
 
 # Configuration
 N = 16384
-TSTEPS = 200
+TSTEPS = 100
 NUM_RUNS = 20
 NUM_THREADS = int(os.environ["OMP_NUM_THREADS"])
 
@@ -89,8 +89,8 @@ MPI_CONFIGS = [(u, v) for (u, v) in {
     (3, 12), (12, 3),
     (2, 18), (18, 2),
     (1, 36), (36, 1),
-    (4, 9), (9, 4)
-    (3, 12), (12, 3)
+    (4, 9), (9, 4),
+    (3, 12), (12, 3),
     (6, 8), (8, 6)
 } if u * v == NUM_CORES
 ]

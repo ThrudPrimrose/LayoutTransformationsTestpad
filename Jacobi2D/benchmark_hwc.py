@@ -15,9 +15,9 @@ from itertools import product
 import re
 
 # Configuration
-N = 1024
-TSTEPS = 200
-NUM_RUNS = 1  # Changed from 20 to 10 for PAPI runs
+N = 16384
+TSTEPS = 100
+NUM_RUNS = 10
 NUM_THREADS = int(os.environ.get("OMP_NUM_THREADS", "128"))
 
 # Output CSV file
@@ -131,11 +131,11 @@ def parse_output(output):
             match = re.search(r'GFLOPS:\s*([\d.]+)', line)
             if match:
                 gflops = float(match.group(1))
-        elif line.startswith('  Total:'):
+        elif 'Total:' in line:
             match = re.search(r'Total:\s*(\d+)', line)
             if match:
                 papi_total = int(match.group(1))
-        elif line.startswith('  Per iteration:'):
+        elif 'Per iteration:' in line:
             match = re.search(r'Per iteration:\s*([\d.]+)', line)
             if match:
                 papi_per_iter = float(match.group(1))

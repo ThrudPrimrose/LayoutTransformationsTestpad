@@ -38,8 +38,8 @@ unset PAPI_ENABLED
 
 cp ../* .
 
-./compile_all.sh
-python3.12 benchmark.py
+./compile_all_papi.sh
+python3.12 benchmark_hwc.py
 
 rm *.py
 rm *.cpp
