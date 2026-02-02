@@ -102,6 +102,7 @@ int main(int argc, char **argv) {
     #ifdef PAPI_ENABLED
     const char* papi_metric = getenv("PAPI_METRIC");
     init_papi(papi_metric);
+    printf("Collecting %s\n", papi_metric);
     #pragma omp parallel 
     {
         #pragma omp critical 

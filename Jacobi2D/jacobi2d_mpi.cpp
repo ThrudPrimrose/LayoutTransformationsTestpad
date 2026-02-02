@@ -3,6 +3,10 @@
 #include <math.h>
 #include <mpi.h>
 
+#ifdef PAPI_ENABLED
+#include "papi_metrics.h"
+#endif
+
 #define MAX(a,b) ((a) > (b) ? (a) : (b))
 #define MIN(a,b) ((a) < (b) ? (a) : (b))
 #define IDX(j, i, stride) ((j) * (stride) + (i))
@@ -253,6 +257,15 @@ int main(int argc, char **argv) {
         printf("N=%d, tsteps=%d, processor grid=%dx%d\n", N, tsteps, px, py);
     }
 
+    #ifdef PAPI_ENABLED
+    const char* papi_metric = getenv("PAPI_METRIC");
+    init_papi_single_thread(papi_metric);
+
+    MPI_Barrier(MPI_COMM_WORLD);
+
+    start_papi_single_thread();
+    #endif
+
     double start_time = MPI_Wtime();
     
     for (int iter = 0; iter < tsteps; iter++) {
@@ -266,6 +279,35 @@ int main(int argc, char **argv) {
     }
     
     double end_time = MPI_Wtime();
+
+    #ifdef PAPI_ENABLED
+    // Stop PAPI counters
+    stop_papi_single_thread();
+
+    MPI_Barrier(MPI_COMM_WORLD);
+
+    // Gather PAPI results from all ranks
+    long long local_count = g_papi_values[0];  // Single-threaded, so only index 0
+    long long total_count = 0;
+    long long *all_counts = NULL;
+    
+    if (rank == 0) {
+        all_counts = (long long*)malloc(domain.nprocs * sizeof(long long));
+    }
+    
+    MPI_Gather(&local_count, 1, MPI_LONG_LONG, all_counts, 1, MPI_LONG_LONG, 0, MPI_COMM_WORLD);
+    
+    if (rank == 0) {
+        printf("\nPAPI Results (%s):\n", papi_metric);
+        for (int i = 0; i < domain.nprocs; i++) {
+            printf("  Rank %d: %lld\n", i, all_counts[i]);
+            total_count += all_counts[i];
+        }
+        printf("  Total: %lld\n", total_count);
+        printf("  Per iteration: %.2f\n", (double)total_count / tsteps);
+        free(all_counts);
+    }
+    #endif
 
     double local_checksum = checksum(u, &domain);
     double global_checksum = 0.0;

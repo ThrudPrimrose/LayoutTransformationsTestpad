@@ -4,6 +4,11 @@
 #include <math.h>
 #include <omp.h>
 
+
+#ifdef PAPI_ENABLED
+#include "papi_metrics.h"
+#endif
+
 #define MAX(a,b) ((a) > (b) ? (a) : (b))
 #define MIN(a,b) ((a) < (b) ? (a) : (b))
 
@@ -331,17 +336,49 @@ int main(int argc, char **argv) {
     if (argc > 2) tsteps = atoi(argv[2]);
     if (argc > 4) BM = atoi(argv[4]);
     if (argc > 5) BN = atoi(argv[5]);
-    
+
     printf("Jacobi2D OpenMP with SoA Block-Contiguous Storage (64-byte aligned)\n");
     printf("N=%d, tsteps=%d, threads=%d, blocks=%dx%d\n", N, tsteps, num_threads, BM, BN);
-    
+
     Jacobi2DSoA solver;
     jacobi_init(&solver, N, BM, BN);
     jacobi_initialize_data(&solver);
-    
+
+
+    #ifdef PAPI_ENABLED
+    const char* papi_metric = getenv("PAPI_METRIC");
+    init_papi(papi_metric);
+    #pragma omp parallel 
+    {
+        #pragma omp critical 
+        {
+            start_papi_thread();
+        }
+    }
+    #endif
+
     double time = jacobi_run(&solver, tsteps);
     double checksum = jacobi_checksum(&solver);
-    
+
+    #ifdef PAPI_ENABLED
+    #pragma omp parallel 
+    {
+        #pragma omp critical 
+        {
+            stop_papi_thread();
+        }
+    }
+    // Print PAPI results
+    long long total_count = 0;
+    printf("\nPAPI Results (%s):\n", papi_metric);
+    for (int i = 0; i < num_threads; i++) {
+        printf("  Thread %d: %lld\n", i, g_papi_values[i]);
+        total_count += g_papi_values[i];
+    }
+    printf("  Total: %lld\n", total_count);
+    printf("  Per iteration: %.2f\n", (double)total_count / tsteps);
+    #endif
+
     printf("Time: %.6f seconds\n", time);
     printf("Checksum: %.10e\n", checksum);
     printf("GFLOPS: %.3f\n", (double)N * N * tsteps * 6 / time / 1e9);
