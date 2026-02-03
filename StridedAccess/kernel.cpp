@@ -102,8 +102,8 @@ static void kernel_2_impl(double* __restrict__ A, double* __restrict__ B) {
         for (int jj = 0; jj < M; jj += TILE_SIZE) {
             __asm__ volatile("" ::: "memory");
             
-            int i_end = (ii + TILE_SIZE <= N) ? ii + TILE_SIZE : N;
-            int j_end = (jj + TILE_SIZE <= M) ? jj + TILE_SIZE : M;
+            int i_end = ii + TILE_SIZE;
+            int j_end = jj + TILE_SIZE;
             
             for (int i = ii; i < i_end; i++) {
                 for (int j = jj; j < j_end; j++) {

@@ -31,6 +31,15 @@ LAYOUTS = [
     (1, 1),  # A:col, B:col
 ]
 
+TILE_CONFIGS = {
+    0: "4x4",
+    1: "8x8",
+    2: "16x16",
+    3: "32x32",
+    4: "64x64",
+    5: "128x128",
+}
+
 def layout_str(a_layout, b_layout):
     a = "row" if a_layout == 0 else "col"
     b = "row" if b_layout == 0 else "col"
