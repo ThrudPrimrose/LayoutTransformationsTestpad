@@ -1,3 +1,4 @@
+from math import prod
 import pandas as pd
 import sys
 
@@ -26,7 +27,7 @@ TILE_CONFIGS = {
 }
 
 
-def compute_reuse_distance(row, N=1024):
+def compute_reuse_distance(row, N=2048):
     """
     Compute average reuse distance for matrix multiply C = A * B
     Based on kernel type, layout, and tile size.
@@ -109,6 +110,104 @@ def compute_reuse_distance(row, N=1024):
 
     return avg_reuse
 
+def compute_tile_closeness(row):
+    kernel = row['kernel']
+    a_layout = row['a_layout']  # 0=row-major, 1=col-major
+    b_layout = row['b_layout']
+    tile_sel = row['tile_sel']
+
+    N = 2048
+
+    tile_size = int(TILE_CONFIGS.get(tile_sel, "4x4").split('x')[0])
+    stride = 2048
+
+    def compute_closeness(strides, dims):
+        total_elements = prod(dims)
+        
+        # Use analytical formula for large sizes
+        if total_elements > 32*32:
+            avg_dist = 0
+            for dim_size, stride in zip(dims, strides):
+                if dim_size > 1:
+                    avg_coord_diff = (dim_size - 1) / 3.0
+                    avg_dist += avg_coord_diff * stride
+            return avg_dist
+        
+        # Exact computation for small sizes
+        total_dist = 0
+        for el_i in range(total_elements):
+            for el_j in range(total_elements):
+                abs_dist = abs(el_i - el_j)
+                
+                memory_dist = 0
+                remaining = abs_dist
+                for dim_idx in range(len(dims) - 1, -1, -1):
+                    coord_diff = remaining % dims[dim_idx]
+                    remaining = remaining // dims[dim_idx]
+                    memory_dist += coord_diff * strides[dim_idx]
+                
+                total_dist += memory_dist
+
+        num_pairs = total_elements * total_elements
+        return total_dist / num_pairs
+
+    def compute_address_span(strides, dims):
+        """Compute address distance between first and last element of tile."""
+        # First element is at address 0
+        # Last element is at address sum((dim-1) * stride) for each dimension
+        max_addr = sum((d - 1) * s for d, s in zip(dims, strides))
+        return max_addr
+
+    if kernel == 0:  # i-outer, j-inner
+        a_stride = [stride, 1] if a_layout == 0 else [1, stride]
+        b_stride = [stride, 1] if b_layout == 0 else [1, stride]
+        a_dim = [1, 8]
+        b_dim = [1, 8]
+    elif kernel == 1:  # j-outer, i-inner
+        a_stride = [1, stride] if a_layout == 0 else [stride, 1]
+        b_stride = [1, stride] if b_layout == 0 else [stride, 1]
+        a_dim = [1, 8]
+        b_dim = [1, 8]
+    elif kernel in [2, 3]:  # tiled or tiled+copy
+        a_stride = [stride, 1] if a_layout == 0 else [1, stride]
+        b_stride = [stride, 1] if b_layout == 0 else [1, stride]
+        a_dim = [tile_size, tile_size]
+        b_dim = [tile_size, tile_size]
+    else:
+        return N * N, N * N
+
+    a_closeness = compute_closeness(a_stride, a_dim)
+    b_closeness = compute_closeness(b_stride, b_dim)
+    avg_closeness = (2 * a_closeness + b_closeness) / 3
+
+    a_span = compute_address_span(a_stride, a_dim)
+    b_span = compute_address_span(b_stride, b_dim)
+    avg_span = (2 * a_span + b_span) / 3
+
+    return avg_closeness, avg_span
+
+def compute_average_stride(row):
+    kernel = row['kernel']
+    a_layout = row['a_layout']  # 0=row-major, 1=col-major
+    b_layout = row['b_layout']
+    tile_sel = row['tile_sel']
+
+    tile_size = int(TILE_CONFIGS.get(tile_sel, "4x4").split('x')[0])
+    """Compute average stride between consecutive accesses."""
+    if kernel == 0:  # i-outer, j-inner
+        av = 1 if a_layout == 0 else 2048
+        bv = 1 if b_layout == 0 else 2048
+    elif kernel == 1:  # j-outer, i-inner
+        av = 1 if a_layout == 1 else 2048
+        bv = 1 if b_layout == 1 else 2048
+    elif kernel in [2, 3]:  # tiled or tiled+copy
+        av = ((tile_size - 1) * 1 + (tile_size - 1) * 2048) / ((tile_size - 1) ** 2)
+        bv = ((tile_size - 1) * 1 + (tile_size - 1) * 2048) / ((tile_size - 1) ** 2)
+    else:
+        return 2048 * 2048
+
+    return (2*av + bv)/3
+
 def main():
     # Parse data
     if len(sys.argv) < 2:
@@ -132,93 +231,74 @@ def main():
 
     df['description'] = df.apply(make_description, axis=1)
     
-    # Compute reuse distance metric
+    # Compute metrics
     df['reuse_distance'] = df.apply(compute_reuse_distance, axis=1)
+    closeness_span = df.apply(compute_tile_closeness, axis=1)
+    df['tile_closeness'] = closeness_span.apply(lambda x: x[0])
+    df['address_span'] = closeness_span.apply(lambda x: x[1])
+    df['avg_stride'] = df.apply(compute_average_stride, axis=1)
 
-    # Sort by mean runtime
-    df_sorted = df.sort_values('mean_ms').reset_index(drop=True)
-    df_sorted['runtime_rank'] = df_sorted.index + 1
-    
-    # Compute reuse distance rank (lower reuse distance = better = lower rank)
-    df_sorted['reuse_rank'] = df_sorted['reuse_distance'].rank(method='min').astype(int)
+    # Define datasets to analyze
+    datasets = [
+        ("ALL KERNELS", df.copy()),
+        ("NON-TILED KERNELS ONLY", df[df['kernel'].isin([0, 1])].copy()),
+    ]
 
-    # Print results
-    print("=" * 140)
-    print("RUNTIME ORDERING (fastest to slowest) with REUSE DISTANCE METRIC")
-    print("=" * 140)
-    print()
-    print(f"{'Rank':<5} {'Runtime':<22} {'Description':<50} {'Reuse Dist (Lower Better)':<12} {'Reuse Rank':<10}")
-    print("-" * 140)
-
-    for _, row in df_sorted.iterrows():
-        runtime_str = f"{row['mean_ms']:8.3f} ms (±{row['stdev_ms']:6.3f})"
-        print(f"{row['runtime_rank']:<5} {runtime_str:<22} {row['description']:<50} {row['reuse_distance']:<12.1f} {row['reuse_rank']:<10}")
-
-    print()
-    print("=" * 140)
-    print("SUMMARY BY KERNEL TYPE")
-    print("=" * 140)
-
-    for kernel_id in sorted(df['kernel'].unique()):
-        kernel_data = df[df['kernel'] == kernel_id]
-        best = kernel_data.loc[kernel_data['mean_ms'].idxmin()]
-        worst = kernel_data.loc[kernel_data['mean_ms'].idxmax()]
+    for title, data in datasets:
+        # Sort by mean runtime
+        df_sorted = data.sort_values('mean_ms').reset_index(drop=True)
+        df_sorted['runtime_rank'] = df_sorted.index + 1
         
-        print(f"\nKernel {kernel_id}: {KERNELS[kernel_id]}")
-        print(f"  Best:  {best['mean_ms']:8.3f} ms | {best['layout']}", end="")
-        if kernel_id in [2, 3]:
-            print(f" | tile={best['tile_size']}")
-        else:
-            print()
-        print(f"  Worst: {worst['mean_ms']:8.3f} ms | {worst['layout']}", end="")
-        if kernel_id in [2, 3]:
-            print(f" | tile={worst['tile_size']}")
-        else:
-            print()
+        # Compute ranks (lower = better)
+        df_sorted['reuse_rank'] = df_sorted['reuse_distance'].rank(method='min').astype(int)
+        df_sorted['closeness_rank'] = df_sorted['tile_closeness'].rank(method='min').astype(int)
+        df_sorted['span_rank'] = df_sorted['address_span'].rank(method='min').astype(int)
+        df_sorted['stride_rank'] = df_sorted['avg_stride'].rank(method='min').astype(int)
 
-    # === TABLE 2: Non-tiled kernels only (kernel 0 and 1) ===
-    print("\n")
-    df2 = df[df['kernel'].isin([0, 1])].copy()
-    
-    # Sort by mean runtime
-    df2_sorted = df2.sort_values('mean_ms').reset_index(drop=True)
-    df2_sorted['runtime_rank'] = df2_sorted.index + 1
-    
-    # Compute reuse distance rank (lower reuse distance = better = lower rank)
-    df2_sorted['reuse_rank'] = df2_sorted['reuse_distance'].rank(method='min').astype(int)
+        # Print results
+        print("=" * 200)
+        print(f"RUNTIME ORDERING (fastest to slowest) - {title}")
+        print("=" * 200)
+        print()
+        print(f"{'Rank':<5} {'Runtime':<22} {'Description':<45} {'ReuseDist':<10} {'ReuseRk':<8} {'Closeness':<12} {'CloseRk':<8} {'AddrSpan':<12} {'SpanRk':<8} {'AvgStride':<10} {'StrideRk':<8}")
+        print("-" * 200)
 
-    # Print results
-    print("=" * 140)
-    print("RUNTIME ORDERING (fastest to slowest) with REUSE DISTANCE METRIC - NON-TILED KERNELS ONLY")
-    print("=" * 140)
-    print()
-    print(f"{'Rank':<5} {'Runtime':<22} {'Description':<50} {'Reuse Dist':<12} {'Reuse Rank':<10}")
-    print("-" * 140)
+        for _, row in df_sorted.iterrows():
+            runtime_str = f"{row['mean_ms']:8.3f} ms (±{row['stdev_ms']:6.3f})"
+            print(f"{row['runtime_rank']:<5} {runtime_str:<22} {row['description']:<45} {row['reuse_distance']:<10.1f} {row['reuse_rank']:<8} {row['tile_closeness']:<12.1f} {row['closeness_rank']:<8} {row['address_span']:<12.1f} {row['span_rank']:<8} {row['avg_stride']:<10.1f} {row['stride_rank']:<8}")
 
-    for _, row in df2_sorted.iterrows():
-        runtime_str = f"{row['mean_ms']:8.3f} ms (±{row['stdev_ms']:6.3f})"
-        print(f"{row['runtime_rank']:<5} {runtime_str:<22} {row['description']:<50} {row['reuse_distance']:<12.1f} {row['reuse_rank']:<10}")
+        print()
+        print("=" * 200)
+        print(f"SUMMARY BY KERNEL TYPE ({title})")
+        print("=" * 200)
 
-    print()
-    print("=" * 140)
-    print("SUMMARY BY KERNEL TYPE (NON-TILED)")
-    print("=" * 140)
+        for kernel_id in sorted(data['kernel'].unique()):
+            kernel_data = data[data['kernel'] == kernel_id]
+            best = kernel_data.loc[kernel_data['mean_ms'].idxmin()]
+            worst = kernel_data.loc[kernel_data['mean_ms'].idxmax()]
+            
+            print(f"\nKernel {kernel_id}: {KERNELS[kernel_id]}")
+            print(f"  Best:  {best['mean_ms']:8.3f} ms | {best['layout']}", end="")
+            if kernel_id in [2, 3]:
+                print(f" | tile={best['tile_size']}")
+            else:
+                print()
+            print(f"  Worst: {worst['mean_ms']:8.3f} ms | {worst['layout']}", end="")
+            if kernel_id in [2, 3]:
+                print(f" | tile={worst['tile_size']}")
+            else:
+                print()
 
-    for kernel_id in sorted(df2['kernel'].unique()):
-        kernel_data = df2[df2['kernel'] == kernel_id]
-        best = kernel_data.loc[kernel_data['mean_ms'].idxmin()]
-        worst = kernel_data.loc[kernel_data['mean_ms'].idxmax()]
-        
-        print(f"\nKernel {kernel_id}: {KERNELS[kernel_id]}")
-        print(f"  Best:  {best['mean_ms']:8.3f} ms | {best['layout']}")
-        print(f"  Worst: {worst['mean_ms']:8.3f} ms | {worst['layout']}")
-
-    print()
-    
-    # Correlation analysis for non-tiled
-    correlation = df2_sorted['mean_ms'].corr(df2_sorted['reuse_distance'])
-    print(f"• Correlation (runtime vs reuse distance): {correlation:.3f}")
+        # Correlation analysis
+        print()
+        print(f"• Correlation (runtime vs reuse_distance): {df_sorted['mean_ms'].corr(df_sorted['reuse_distance']):.3f}")
+        print(f"• Correlation (runtime vs tile_closeness): {df_sorted['mean_ms'].corr(df_sorted['tile_closeness']):.3f}")
+        print(f"• Correlation (runtime vs address_span):   {df_sorted['mean_ms'].corr(df_sorted['address_span']):.3f}")
+        print(f"• Correlation (runtime vs avg_stride):     {df_sorted['mean_ms'].corr(df_sorted['avg_stride']):.3f}")
+        print("\n")
 
 
+if __name__ == "__main__":
+    main()
 if __name__ == "__main__":
     main()

@@ -39,6 +39,7 @@ TILE_CONFIGS = {
     4: "64x64",
     5: "128x128",
 }
+TILES = TILE_CONFIGS
 
 def layout_str(a_layout, b_layout):
     a = "row" if a_layout == 0 else "col"
@@ -169,14 +170,6 @@ def run_executable(exe, num_runs=1):
             print(f"  Run error: {e}")
     return results
 
-TILES = {
-    0: "4x4",
-    1: "8x8",
-    2: "16x16",
-    3: "32x32",
-    4: "64x64",
-    5: "128x128",
-}
 
 def tile_str(kernel_id: int, tile_sel_id: int):
     if (kernel_id == 2 or kernel_id == 3):
