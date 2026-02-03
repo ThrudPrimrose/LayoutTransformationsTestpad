@@ -17,6 +17,7 @@ Usage:
 import numpy as np
 from pathlib import Path
 
+results = dict()
 
 def read_array(array_name, timestep, data_dir='.'):
     """
@@ -44,7 +45,7 @@ def read_array(array_name, timestep, data_dir='.'):
         return _parse_simple_file_for_array(direct_file2)
 
     # Search structured files: p_patch, p_prog, p_metrics
-    for base_name in ['p_patch', 'p_prog', 'p_metrics']:
+    for base_name in ['p_patch', 'p_prog', 'p_metrics', 'p_diag']:
         # Try with timestep
         for fp in [f"{base_name}.t0.{timestep}.data", f"{base_name}.{timestep}.data"]:
             filepath = data_dir / fp
@@ -315,7 +316,6 @@ def _parse_structured_file_for_scalar(filepath):
 # ============================================================================
 # USAGE EXAMPLE
 # ============================================================================
-
 if __name__ == "__main__":
     import sys
     
@@ -323,82 +323,86 @@ if __name__ == "__main__":
     data_dir = sys.argv[1] if len(sys.argv) > 1 else '/home/primrose/Work/icon-artifacts/velocity/data_nproma20480/'
     
     print("=" * 70)
-    print("ICON DATA PARSER - USAGE EXAMPLE")
+    print("ICON DATA PARSER - LOADING ALL ARRAYS")
     print("=" * 70)
     print()
-
-    print("Example 0: Read istep scalar")
+    
+    # Define all scalars and arrays needed for the stencil
+    scalars_to_read = [
+        'istep',
+        'nblks_c',
+        'nblks_e',
+        'nblks_v',
+    ]
+    
+    arrays_to_read = [
+        # Input arrays
+        'vn',
+        'z_kin_hor_e',
+        'z_ekinh',
+        'zeta',
+        'p_diag_vt',
+        'p_diag_vn_ie',
+        'z_w_con_c_full',
+        
+        # Metric coefficients
+        'coeff_gradekin',
+        'ddqz_z_full_e',
+        'f_e',
+        
+        # Interpolation coefficients
+        'c_lin_e',
+        
+        # Connectivity arrays
+        'edge_cell_idx',
+        'edge_cell_blk',
+        'edge_vertex_idx',
+        'edge_vertex_blk',
+    ]
+    
+    timestep = 1
+    loaded_scalars = {}
+    loaded_arrays = {}
+    
+    # Read scalars
+    print("LOADING SCALARS:")
     print("-" * 70)
-    try:
-        istep = read_scalar('istep', timestep=1, data_dir=data_dir)
-        print(f"✓ Read istep scalar")
-        print(f"  Value: {istep}")
-        print(f"  Type:  {type(istep).__name__}")
-    except FileNotFoundError as e:
-        print(f"✗ {e}")
-    print()
-
-    # Example 1: Read a direct array file
-    print("Example 1: Read velocity array")
-    print("-" * 70)
-    try:
-        vn = read_array('vn', timestep=1, data_dir=data_dir)
-        print(f"  Type:  {vn.dtype}")
-        print(f"  Shape: {vn.shape}")
-        print(f"  Type:  {vn.dtype}")
-        print(f"  First 5 entries:")
-        print(f"    {vn.ravel()[:5]}")
-    except FileNotFoundError as e:
-        print(f"✗ {e}")
-    print()
-
-    # Example 2: Read scalar from structured file
-    print("Example 2: Read scalar value")
-    print("-" * 70)
-    try:
-        nblks_c = read_scalar('nblks_c', timestep=1, data_dir=data_dir)
-        print(f"✓ Read nblks_c")
-        print(f"  Value: {nblks_c}")
-        print(f"  Type:  {type(nblks_c).__name__}")
-    except FileNotFoundError as e:
-        print(f"✗ {e}")
-    print()
-
-    # Example 2: Read scalar from structured file
-    print("Example 2.2: Read scalar value")
-    print("-" * 70)
-    try:
-        nblks_e = read_scalar('nblks_e', timestep=1, data_dir=data_dir)
-        print(f"✓ Read nblks_e")
-        print(f"  Value: {nblks_e}")
-        print(f"  Type:  {type(nblks_e).__name__}")
-    except FileNotFoundError as e:
-        print(f"✗ {e}")
+    for name in scalars_to_read:
+        try:
+            value = read_scalar(name, timestep=timestep, data_dir=data_dir)
+            loaded_scalars[name] = value
+            print(f"✓ {name:20s} = {value:6d}  (type: {type(value).__name__})")
+        except FileNotFoundError as e:
+            print(f"✗ {name:20s} - {e}")
     print()
     
-    # Example 3: Read connectivity array
-    print("Example 3: Read connectivity array")
+    # Read arrays
+    print("LOADING ARRAYS:")
     print("-" * 70)
-    try:
-        cell_idx = read_array('edges_cell_idx', timestep=1, data_dir=data_dir)
-        print(f"✓ Read edges_cell_idx")
-        print(f"  Shape: {cell_idx.shape}")
-        print(f"  Type:  {cell_idx.dtype}")
-        print(f"  First 5 entries:")
-        print(f"    {cell_idx.ravel()[:5]}")
-    except FileNotFoundError as e:
-        print(f"✗ {e}")
+    for name in arrays_to_read:
+        try:
+            arr = read_array(name, timestep=timestep, data_dir=data_dir)
+            loaded_arrays[name] = arr
+            print(f"✓ {name:20s} shape={str(arr.shape):25s} dtype={arr.dtype}  "
+                  f"range=[{arr.min():.3e}, {arr.max():.3e}]")
+        except FileNotFoundError as e:
+            print(f"✗ {name:20s} - {e}")
     print()
-
-    print("Example 4: Z kin hor e")
-    print("-" * 70)
-    try:
-        z_kin_hor_e = read_array('z_kin_hor_e', timestep=1, data_dir=data_dir)
-        print(f"✓ Read z_kin_hor_e")
-        print(f"  Shape: {z_kin_hor_e.shape}")
-        print(f"  Type:  {z_kin_hor_e.dtype}")
-        print(f"  First 5 entries:")
-        print(f"    {z_kin_hor_e.ravel()[:5]}")
-    except FileNotFoundError as e:
-        print(f"✗ {e}")
+    
+    # Summary
+    print("=" * 70)
+    print("SUMMARY")
+    print("=" * 70)
+    print(f"Loaded {len(loaded_scalars)}/{len(scalars_to_read)} scalars")
+    print(f"Loaded {len(loaded_arrays)}/{len(arrays_to_read)} arrays")
     print()
+    
+    # Show sample values
+    if loaded_arrays:
+        print("SAMPLE VALUES (first 5 elements):")
+        print("-" * 70)
+        for name in ['vn', 'z_kin_hor_e', 'edges_cell_idx']:
+            if name in loaded_arrays:
+                arr = loaded_arrays[name]
+                print(f"{name:20s}: {arr.ravel()[:5]}")
+        print()

@@ -1,0 +1,3 @@
+[submodule "TensorCoreGEMMs/ShriramGEMMSamples"]
+	path = TensorCoreGEMMs/ShriramGEMMSamples
+	url = https://github.com/shriramch/matmuls.git
