@@ -19,15 +19,13 @@ LAYOUTS = {
     (1, 1): "A:col, B:col",
 }
 
-TILE_CONFIGS = {
-    0: "4x4",
-    1: "8x8",
-    2: "16x16",
-    3: "32x32",
-    4: "64x64",
-    5: "128x128",
-}
 
+TILE_CONFIGS = {
+    0: "1x1",
+    1: "2x2",
+    2: "4x4",
+    3: "8x8",
+}
 
 
 def compute_reuse_distance(row, N=2048):
@@ -43,27 +41,34 @@ def compute_reuse_distance(row, N=2048):
     kernel = row['kernel']
     a_layout = row['a_layout']  # 0=row-major, 1=col-major
     b_layout = row['b_layout']
-    tile_sel = row['tile_sel']
+    thread_tile_sel = row['thread_tile_sel']
 
-    tile_size = int(TILE_CONFIGS.get(tile_sel, "4x4").split('x')[0])
+    tile_size_x = int(TILE_CONFIGS.get(thread_tile_sel, "1x1").split('x')[0]) * 32
+    tile_size_y = int(TILE_CONFIGS.get(thread_tile_sel, "1x1").split('x')[0])
     cache_line_size = 8
     stride = 2048
 
     # The kernel is A[:] = ( A[:] + B[:] ) * scale
 
-    def tile_reuse():
-        if tile_size < cache_line_size:
-            non_unit = (tile_size - 1) * ((stride + cache_line_size) // cache_line_size) + 1
-            unit = (tile_size * tile_size - tile_size + 1)
-
-            # penalty for tile_size
-            return (non_unit + unit) / (tile_size * tile_size)
+    def tile_reuse_a():
+        if a_layout == 0:
+            unit = tile_size_x * tile_size_y - tile_size_y
+            non_unit = tile_size_y * stride
+            return (unit + non_unit) / (tile_size_y * tile_size_x)
         else:
-            non_unit = (tile_size - 1) * ((stride + cache_line_size) // cache_line_size)
-            unit = (tile_size * tile_size - tile_size)
+            unit = tile_size_x * tile_size_y - tile_size_x
+            non_unit = tile_size_x * stride
+            return (unit + non_unit) / (tile_size_y * tile_size_x)
 
-            return (non_unit + unit) / (tile_size * tile_size)
-
+    def tile_reuse_b():
+        if b_layout == 0:
+            unit = tile_size_x * tile_size_y - tile_size_y
+            non_unit = tile_size_y * stride
+            return (unit + non_unit) / (tile_size_y * tile_size_x)
+        else:
+            unit = tile_size_x * tile_size_y - tile_size_x
+            non_unit = tile_size_x * stride
+            return (unit + non_unit) / (tile_size_y * tile_size_x)
 
     if kernel == 0:  # i-outer, j-inner: for i: for j: for k: C[i,j] += A[i,k] * B[k,j]
         # A access pattern: A[i,k] - iterates over k in inner-ish loop
@@ -75,26 +80,25 @@ def compute_reuse_distance(row, N=2048):
         if a_layout == 0:  # A row-major: A[i,k] and A[i,k+1] are adjacent
             a_reuse = 1
         else:  # A col-major: A[i,k] and A[i+1,k] are adjacent, but we iterate over k
-            a_reuse = (stride/8) - 1
+            a_reuse = (stride/16) - 1
         
         if b_layout == 0:  # B row-major: B[k,j] and B[k,j+1] adjacent, j is innermost
             b_reuse = 1
         else:  # B col-major: B[k,j] and B[k+1,j] adjacent
-            b_reuse = (stride/8) - 1  # stride-N access
+            b_reuse = (stride/16) - 1  # stride-N access
 
         avg_reuse = ((2*a_reuse) + b_reuse) / 3
-
     elif kernel == 1:  # j-outer, i-inner: for j: for i: for k: C[i,j] += A[i,k] * B[k,j]
         # A access pattern: A[i,k] - i changes in inner-ish loop
         # B access pattern: B[k,j] - j is outermost, reused across i loop
         
         if a_layout == 0:  # A row-major: stride-1 over k, stride-N over i
-            a_reuse = (stride/8) - 1  # i changes, causing stride-N jumps
+            a_reuse = (stride/16) - 1  # i changes, causing stride-N jumps
         else:  # A col-major: A[i,k] and A[i+1,k] adjacent, i is inner
             a_reuse = 1  # good spatial locality
         
         if b_layout == 0:  # B row-major: B[k,j] and B[k,j+1] adjacent, but j is outer
-            b_reuse = (stride/8) - 1  # poor reuse
+            b_reuse = (stride/16) - 1  # poor reuse
         else:  # B col-major: B[k,j] and B[k+1,j] adjacent
             b_reuse = 1  # reuse across i-loop
         
@@ -104,103 +108,15 @@ def compute_reuse_distance(row, N=2048):
         # Tiling improves reuse by keeping tile in cache
         # Reuse distance bounded by tile working set
         # Regardless of the order, 1 access is strided other access not strided
-        reuse = tile_reuse()
-        avg_reuse = reuse
+        reuse_a = tile_reuse_a()
+        reuse_b = tile_reuse_b()
+        avg_reuse = (2*reuse_a + reuse_b) / 3
     elif kernel == 3:  # tiled+copy, follows schedule of 0
         # Copy to contiguous buffer eliminates layout penalty
         # Reuse distance mainly depends on tile size
-        reuse = tile_reuse()
-        avg_reuse = reuse
-    else:
-        avg_reuse = N * N  # unknown, assume worst
-
-    return avg_reuse
-
-
-def compute_memory_efficiency(row, N=2048):
-    """
-    Compute average reuse distance for matrix multiply C = A * B
-    Based on kernel type, layout, and tile size.
-    
-    For row-major: elements in same row are contiguous
-    For col-major: elements in same column are contiguous
-    
-    Reuse distance = number of unique memory accesses between two accesses to the same element
-    """
-    kernel = row['kernel']
-    a_layout = row['a_layout']  # 0=row-major, 1=col-major
-    b_layout = row['b_layout']
-    tile_sel = row['tile_sel']
-
-    tile_size = int(TILE_CONFIGS.get(tile_sel, "4x4").split('x')[0])
-    cache_line_size = 8
-    stride = 2048
-
-    # The kernel is A[:] = ( A[:] + B[:] ) * scale
-
-    def tile_reuse():
-        if tile_size < cache_line_size:
-            non_unit = (tile_size - 1) * ((stride + cache_line_size) // cache_line_size) + 1
-            unit = (tile_size * tile_size - tile_size + 1)
-
-            # penalty for tile_size
-            return (non_unit + unit) / (tile_size * tile_size)
-        else:
-            non_unit = (tile_size - 1) * ((stride + cache_line_size) // cache_line_size)
-            unit = (tile_size * tile_size - tile_size)
-
-            return (non_unit + unit) / (tile_size * tile_size)
-
-    # max 1.0, min 0.5
-    def tile_prefetch_overlap():
-        return 0.5 + 1/tile_size
-
-    if kernel == 0:  # i-outer, j-inner: for i: for j: for k: C[i,j] += A[i,k] * B[k,j]
-        # A access pattern: A[i,k] - iterates over k in inner-ish loop
-        # B access pattern: B[k,j] - iterates over j in inner loop, k in middle
-        
-        # A reuse: same A[i,k] reused across j loop (N times), distance ~ N (size of j loop)
-        # B reuse: B[k,j] - j changes every iteration, k changes every N iterations
-        
-        if a_layout == 0:  # A row-major: A[i,k] and A[i,k+1] are adjacent
-            a_reuse = 1
-        else:  # A col-major: A[i,k] and A[i+1,k] are adjacent, but we iterate over k
-            a_reuse = ((stride/8) - 1) * 0.5 # Minimum prefetch efficiency
-        
-        if b_layout == 0:  # B row-major: B[k,j] and B[k,j+1] adjacent, j is innermost
-            b_reuse = 1
-        else:  # B col-major: B[k,j] and B[k+1,j] adjacent
-            b_reuse = ((stride/8) - 1) * 0.5  # stride-N access
-
-        avg_reuse = ((2*a_reuse) + b_reuse) / 3
-
-    elif kernel == 1:  # j-outer, i-inner: for j: for i: for k: C[i,j] += A[i,k] * B[k,j]
-        # A access pattern: A[i,k] - i changes in inner-ish loop
-        # B access pattern: B[k,j] - j is outermost, reused across i loop
-        
-        if a_layout == 0:  # A row-major: stride-1 over k, stride-N over i
-            a_reuse = ((stride/8) - 1) * 0.5 # i changes, causing stride-N jumps
-        else:  # A col-major: A[i,k] and A[i+1,k] adjacent, i is inner
-            a_reuse = 1  # good spatial locality
-        
-        if b_layout == 0:  # B row-major: B[k,j] and B[k,j+1] adjacent, but j is outer
-            b_reuse = ((stride/8) - 1) * 0.5  # poor reuse
-        else:  # B col-major: B[k,j] and B[k+1,j] adjacent
-            b_reuse = 1  # reuse across i-loop
-        
-        avg_reuse = ((2*a_reuse) + b_reuse) / 3
-        
-    elif kernel == 2:  # tiled, follows schedule of 0, but should be irrelevant
-        # Tiling improves reuse by keeping tile in cache
-        # Reuse distance bounded by tile working set
-        # Regardless of the order, 1 access is strided other access not strided
-        reuse = tile_reuse() * tile_prefetch_overlap()
-        avg_reuse = reuse
-    elif kernel == 3:  # tiled+copy, follows schedule of 0
-        # Copy to contiguous buffer eliminates layout penalty
-        # Reuse distance mainly depends on tile size
-        reuse = tile_reuse() * tile_prefetch_overlap()
-        avg_reuse = reuse
+        reuse_a = tile_reuse_a()
+        reuse_b = tile_reuse_b()
+        avg_reuse = (2*reuse_a + reuse_b) / 3
     else:
         avg_reuse = N * N  # unknown, assume worst
 
@@ -219,10 +135,10 @@ def compute_reuse_distance_w_penalty(row, N=2048):
     kernel = row['kernel']
     a_layout = row['a_layout']  # 0=row-major, 1=col-major
     b_layout = row['b_layout']
-    tile_sel = row['tile_sel']
+    thread_tile_sel = row['thread_tile_sel']
 
-    tile_size = int(TILE_CONFIGS.get(tile_sel, "4x4").split('x')[0])
-    cache_line_size = 8
+    tile_size = int(TILE_CONFIGS.get(thread_tile_sel, "4x4").split('x')[0])
+    cache_line_size = 16
     stride = 2048
 
     # The kernel is A[:] = ( A[:] + B[:] ) * scale
@@ -234,7 +150,7 @@ def compute_reuse_distance_w_penalty(row, N=2048):
 
             # penalty for tile_size
             # 3 tiles therefore divide L1 in 3
-            penalty = max(1, ( tile_size * tile_size ) // (32 * 1024 / (8 * 3)))
+            penalty = max(1, ( tile_size * tile_size ) // (48 * 1024 / (16 * 3)))
             return penalty * (non_unit + unit) / (tile_size * tile_size)
         else:
             non_unit = (tile_size - 1) * ((stride + cache_line_size) // cache_line_size)
@@ -243,7 +159,7 @@ def compute_reuse_distance_w_penalty(row, N=2048):
             # penalty for tile_size
             # take half of L1?
             # 3 tiles therefore divide L1 in 3
-            penalty = max(1, ( tile_size * tile_size ) // (16 * 1024 / (8 * 3)))
+            penalty = max(1, ( tile_size * tile_size ) // (16 * 1024 / (16 * 3)))
             return penalty * (non_unit + unit) / (tile_size * tile_size)
 
 
@@ -257,12 +173,12 @@ def compute_reuse_distance_w_penalty(row, N=2048):
         if a_layout == 0:  # A row-major: A[i,k] and A[i,k+1] are adjacent
             a_reuse = 1
         else:  # A col-major: A[i,k] and A[i+1,k] are adjacent, but we iterate over k
-            a_reuse = (stride/8) - 1
+            a_reuse = (stride/16) - 1
         
         if b_layout == 0:  # B row-major: B[k,j] and B[k,j+1] adjacent, j is innermost
             b_reuse = 1
         else:  # B col-major: B[k,j] and B[k+1,j] adjacent
-            b_reuse = (stride/8) - 1  # stride-N access
+            b_reuse = (stride/16) - 1  # stride-N access
 
         avg_reuse = ((2*a_reuse) + b_reuse) / 3
 
@@ -271,12 +187,12 @@ def compute_reuse_distance_w_penalty(row, N=2048):
         # B access pattern: B[k,j] - j is outermost, reused across i loop
         
         if a_layout == 0:  # A row-major: stride-1 over k, stride-N over i
-            a_reuse = (stride/8) - 1  # i changes, causing stride-N jumps
+            a_reuse = (stride/16) - 1  # i changes, causing stride-N jumps
         else:  # A col-major: A[i,k] and A[i+1,k] adjacent, i is inner
             a_reuse = 1  # good spatial locality
         
         if b_layout == 0:  # B row-major: B[k,j] and B[k,j+1] adjacent, but j is outer
-            b_reuse = (stride/8) - 1  # poor reuse
+            b_reuse = (stride/16) - 1  # poor reuse
         else:  # B col-major: B[k,j] and B[k+1,j] adjacent
             b_reuse = 1  # reuse across i-loop
         
@@ -303,11 +219,11 @@ def compute_tile_closeness(row):
     kernel = row['kernel']
     a_layout = row['a_layout']  # 0=row-major, 1=col-major
     b_layout = row['b_layout']
-    tile_sel = row['tile_sel']
+    thread_tile_sel = row['thread_tile_sel']
 
     N = 2048
 
-    tile_size = int(TILE_CONFIGS.get(tile_sel, "4x4").split('x')[0])
+    tile_size = int(TILE_CONFIGS.get(thread_tile_sel, "4x4").split('x')[0])
     stride = 2048
 
     def compute_closeness(strides, dims):
@@ -350,13 +266,13 @@ def compute_tile_closeness(row):
     if kernel == 0:  # i-outer, j-inner
         a_stride = [stride, 1] if a_layout == 0 else [1, stride]
         b_stride = [stride, 1] if b_layout == 0 else [1, stride]
-        a_dim = [1, 8]
-        b_dim = [1, 8]
+        a_dim = [1, 32]
+        b_dim = [1, 32]
     elif kernel == 1:  # j-outer, i-inner
         a_stride = [1, stride] if a_layout == 0 else [stride, 1]
         b_stride = [1, stride] if b_layout == 0 else [stride, 1]
-        a_dim = [1, 8]
-        b_dim = [1, 8]
+        a_dim = [1, 32]
+        b_dim = [1, 32]
     elif kernel in [2, 3]:  # tiled or tiled+copy
         a_stride = [stride, 1] if a_layout == 0 else [1, stride]
         b_stride = [stride, 1] if b_layout == 0 else [1, stride]
@@ -379,9 +295,9 @@ def compute_average_stride(row):
     kernel = row['kernel']
     a_layout = row['a_layout']  # 0=row-major, 1=col-major
     b_layout = row['b_layout']
-    tile_sel = row['tile_sel']
+    thread_tile_sel = row['thread_tile_sel']
 
-    tile_size = int(TILE_CONFIGS.get(tile_sel, "4x4").split('x')[0])
+    tile_size = int(TILE_CONFIGS.get(thread_tile_sel, "4x4").split('x')[0])
     """Compute average stride between consecutive accesses."""
     if kernel == 0:  # i-outer, j-inner
         av = 1 if a_layout == 0 else 2048
@@ -391,7 +307,7 @@ def compute_average_stride(row):
         bv = 1 if b_layout == 1 else 2048
     elif kernel in [2, 3]:  # tiled or tiled+copy
         if tile_size == 1:
-            tile_size +=1
+            tile_size += 1
         av = ((tile_size * tile_size - tile_size) * 1 + (tile_size) * 2048) / ((tile_size - 1) ** 2)
         bv = ((tile_size * tile_size - tile_size) * 1 + (tile_size) * 2048) / ((tile_size - 1) ** 2)
     else:
@@ -413,11 +329,11 @@ def compute_cache_line_utilization(row):
     kernel = row['kernel']
     a_layout = row['a_layout']  # 0=row-major, 1=col-major
     b_layout = row['b_layout']
-    tile_sel = row['tile_sel']
+    thread_tile_sel = row['thread_tile_sel']
     
     cache_line_elements = 8
     N = 2048
-    tile_size = int(TILE_CONFIGS.get(tile_sel, "4x4").split('x')[0])
+    tile_size = int(TILE_CONFIGS.get(thread_tile_sel, "4x4").split('x')[0])
     
     def get_utilization_for_stride(stride):
         """Given a stride, compute cache line utilization."""
@@ -519,13 +435,13 @@ def compute_page_utilization(row):
     kernel = row['kernel']
     a_layout = row['a_layout']
     b_layout = row['b_layout']
-    tile_sel = row['tile_sel']
+    thread_tile_sel = row['thread_tile_sel']
     
     page_size_bytes = 4096
     element_size = 8  # 8 bytes per double
     elements_per_page = page_size_bytes // element_size  # 512 elements
     N = 2048
-    tile_size = int(TILE_CONFIGS.get(tile_sel, "4x4").split('x')[0])
+    tile_size = int(TILE_CONFIGS.get(thread_tile_sel, "4x4").split('x')[0])
     
     def compute_pages_for_access(num_elements, stride, matrix_stride=N):
         """
@@ -642,8 +558,8 @@ def compute_effective_locality(row):
     import math
     
     kernel = row['kernel']
-    tile_sel = row['tile_sel']
-    tile_size = int(TILE_CONFIGS.get(tile_sel, "4x4").split('x')[0])
+    thread_tile_sel = row['thread_tile_sel']
+    tile_size = int(TILE_CONFIGS.get(thread_tile_sel, "4x4").split('x')[0])
     
     # Get base stride metric
     avg_stride = compute_average_stride(row)
@@ -653,10 +569,10 @@ def compute_effective_locality(row):
     if kernel in [0, 1]:
         # Non-tiled: working set is essentially unbounded (whole rows/cols)
         # The stride already captures the penalty
-        working_set_bytes = 8 * 8  # One row/column, 1 line at a time
+        working_set_bytes = 32 * 8  # One row/column, 1 line at a time
     else:
         # Tiled: working set is 3 tiles (A tile, B tile, C tile)
-        working_set_bytes = 3 * tile_size * tile_size * 8
+        working_set_bytes = 3 * tile_size * tile_size * 32 * 8
 
     # How many cache lines needed
     num_complete_caches = (working_set_bytes + 32 * 1024 - 1) // (32 * 1024)
@@ -679,7 +595,7 @@ def main():
     # Add human-readable columns
     df['kernel_name'] = df['kernel'].map(KERNELS)
     df['layout'] = df.apply(lambda r: LAYOUTS[(r['a_layout'], r['b_layout'])], axis=1)
-    df['tile_size'] = df['tile_sel'].map(TILE_CONFIGS)
+    df['tile_size'] = df['thread_tile_sel'].map(TILE_CONFIGS)
 
     # Create description column
     def make_description(row):
@@ -702,7 +618,7 @@ def main():
     df['cache_line_util'] = df.apply(compute_cache_line_utilization, axis=1)
     page_metrics = df.apply(compute_page_utilization, axis=1)
     df['page_util'] = page_metrics.apply(lambda x: x[2])
-    df['mem_efficiency'] = df.apply(compute_memory_efficiency, axis=1)
+    df['mem_efficiency'] = df['cache_line_util'] * df['page_util']
     df.drop(columns=['cache_line_util', 'page_util'], inplace=True)
     
     # Effective locality: combines stride with cache working set penalty
@@ -710,7 +626,7 @@ def main():
 
     # Define datasets to analyze (exclude tiled+copy kernel=3 from main analysis)
     datasets = [
-        ("ALL KERNELS (excl. tiled+copy)", df[df['kernel'] != 3].copy()),
+        ("ALL KERNELS (excl. tiled+copy)", df[df['kernel'] != 2].copy()),
         ("NON-TILED KERNELS ONLY", df[df['kernel'].isin([0, 1])].copy()),
     ]
 
@@ -726,7 +642,7 @@ def main():
         df_sorted['span_rank'] = df_sorted['address_span'].rank(method='min').astype(int)
         df_sorted['stride_rank'] = df_sorted['avg_stride'].rank(method='min').astype(int)
         # For efficiency, higher is better, so we rank in descending order
-        df_sorted['mem_eff_rank'] = df_sorted['mem_efficiency'].rank(method='min', ascending=True).astype(int)
+        df_sorted['mem_eff_rank'] = df_sorted['mem_efficiency'].rank(method='min', ascending=False).astype(int)
         # For effective locality, lower is better
         df_sorted['eff_loc_rank'] = df_sorted['eff_locality'].rank(method='min').astype(int)
 

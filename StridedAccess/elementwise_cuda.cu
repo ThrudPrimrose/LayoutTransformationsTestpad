@@ -4,12 +4,13 @@
 #include <cuda_runtime.h>
 
 // Configuration
-#ifndef N
-#define N 4192
-#endif
-
+// Matrix dimensions: M rows x N columns
 #ifndef M
 #define M 4192
+#endif
+
+#ifndef N
+#define N 4192
 #endif
 
 #ifndef KERNEL
@@ -39,16 +40,18 @@ static constexpr double SCALE = 1.5;
 #define BLOCK_SIZE_Y 1
 
 // Access macros for different layouts (device)
+// Matrix is M rows x N columns
+// i = row index [0, M), j = column index [0, N)
 #if A_LAYOUT == 0
-    #define A_IDX(i, j) ((i) * M + (j))
+    #define A_IDX(i, j) ((i) * N + (j))  // row-major: row * num_cols + col
 #else
-    #define A_IDX(i, j) ((j) * N + (i))
+    #define A_IDX(i, j) ((j) * M + (i))  // col-major: col * num_rows + row
 #endif
 
 #if B_LAYOUT == 0
-    #define B_IDX(i, j) ((i) * M + (j))
+    #define B_IDX(i, j) ((i) * N + (j))
 #else
-    #define B_IDX(i, j) ((j) * N + (i))
+    #define B_IDX(i, j) ((j) * M + (i))
 #endif
 
 // Error checking macro
@@ -70,11 +73,12 @@ static inline uint64_t xorshift64(uint64_t& state) {
 }
 
 // Initialize arrays with deterministic pseudo-random values (host)
+// Matrix is M rows x N columns
 static void init_arrays(double* __restrict__ A, double* __restrict__ B) {
     uint64_t seed_a = 0x123456789ABCDEF0ULL;
     uint64_t seed_b = 0xFEDCBA9876543210ULL;
-    for (int i = 0; i < N; i++) {
-        for (int j = 0; j < M; j++) {
+    for (int i = 0; i < M; i++) {       // i = row [0, M)
+        for (int j = 0; j < N; j++) {   // j = col [0, N)
             A[A_IDX(i, j)] = (double)(xorshift64(seed_a) % 10000) / 100.0;
             B[B_IDX(i, j)] = (double)(xorshift64(seed_b) % 10000) / 100.0;
         }
@@ -84,11 +88,11 @@ static void init_arrays(double* __restrict__ A, double* __restrict__ B) {
 // Kernel 0: i-outer, j-inner loop order (row-major traversal pattern)
 __global__ void __launch_bounds__(128) kernel_0(double* __restrict__ A, double* __restrict__ B) {
     int idx = blockIdx.x * blockDim.x + threadIdx.x;
-    int total = N * M;
+    int total = M * N;
     
     if (idx < total) {
-        int i = idx / M;
-        int j = idx % M;
+        int i = idx / N;  // row
+        int j = idx % N;  // column
         A[A_IDX(i, j)] = (A[A_IDX(i, j)] + B[B_IDX(i, j)]) * SCALE;
     }
 }
@@ -96,123 +100,159 @@ __global__ void __launch_bounds__(128) kernel_0(double* __restrict__ A, double* 
 // Kernel 1: j-outer, i-inner loop order (column-major traversal pattern)
 __global__ void __launch_bounds__(128) kernel_1(double* __restrict__ A, double* __restrict__ B) {
     int idx = blockIdx.x * blockDim.x + threadIdx.x;
-    int total = N * M;
+    int total = M * N;
     
     if (idx < total) {
-        int j = idx / N;
-        int i = idx % N;
+        int j = idx / M;  // column
+        int i = idx % M;  // row
         A[A_IDX(i, j)] = (A[A_IDX(i, j)] + B[B_IDX(i, j)]) * SCALE;
     }
 }
 
 // Kernel 2: Tiled - each thread computes THREAD_TILE x THREAD_TILE elements
+// Consecutive threads (threadIdx.x) access consecutive columns (j) for row-major coalescing
 template<int TILE_SIZE, int THREAD_TILE>
 __global__ void __launch_bounds__(128) kernel_2_impl(double* __restrict__ A, double* __restrict__ B) {
-    // Position of this thread-tile within the tile
-
-    int ii = threadIdx.x * THREAD_TILE + blockIdx.x * THREAD_TILE * BLOCK_SIZE_X;
-    int jj = threadIdx.y * THREAD_TILE + blockIdx.y * BLOCK_SIZE_Y;
+    // Block tile dimensions
+    constexpr int TILE_COLS = BLOCK_SIZE_X * THREAD_TILE;  // columns covered by block
+    constexpr int TILE_ROWS = BLOCK_SIZE_Y * THREAD_TILE;  // rows covered by block
+    
+    // Block origin in global coordinates
+    // blockIdx.x -> columns (j), blockIdx.y -> rows (i)
+    int block_col = blockIdx.x * TILE_COLS;
+    int block_row = blockIdx.y * TILE_ROWS;
 
     // Each thread computes THREAD_TILE x THREAD_TILE elements
+    // Strided pattern - consecutive threads access consecutive j values
     #pragma unroll
     for (int di = 0; di < THREAD_TILE; di++) {
+        int i = block_row + threadIdx.y + di * BLOCK_SIZE_Y;
+        
         #pragma unroll
         for (int dj = 0; dj < THREAD_TILE; dj++) {
-            int i = ii + di;
-            int j = jj + dj;
-            
-            if (i < N && j < M) {
+            // Consecutive threadIdx.x values give consecutive j values
+            int j = block_col + threadIdx.x + dj * BLOCK_SIZE_X;
+
+            if (i < M && j < N) {
                 A[A_IDX(i, j)] = (A[A_IDX(i, j)] + B[B_IDX(i, j)]) * SCALE;
             }
         }
     }
 }
 
-// Kernel 3: Tiled with shared memory - each thread computes THREAD_TILE x THREAD_TILE elements
 template<int TILE_SIZE, int THREAD_TILE>
-__global__ void kernel_3_impl(double* __restrict__ A, double* __restrict__ B) {
-    // Shared memory tile dimensions = what this entire block processes
-    constexpr int TILE_ROWS = BLOCK_SIZE_X * THREAD_TILE;  // 128 * THREAD_TILE
-    constexpr int TILE_COLS = BLOCK_SIZE_Y * THREAD_TILE;  // 1 * THREAD_TILE
+__global__ void __launch_bounds__(128)
+kernel_3_impl(double* __restrict__ A, double* __restrict__ B)
+{
+    // Tile dimensions
+    constexpr int TILE_COLS = BLOCK_SIZE_X * THREAD_TILE; // columns (j)
+    constexpr int TILE_ROWS = BLOCK_SIZE_Y * THREAD_TILE; // rows (i)
     constexpr int TILE_ELEMENTS = TILE_ROWS * TILE_COLS;
-    
+
     extern __shared__ double smem[];
-    double* A_tile = smem;
-    double* B_tile = smem + TILE_ELEMENTS;
-    double* C_tile = smem + 2 * TILE_ELEMENTS;
-    
-    // Block's starting position in global memory
-    int block_ii = blockIdx.x * TILE_ROWS;
-    int block_jj = blockIdx.y * TILE_COLS;
-    
-    // Cooperative load of A tile to shared memory
+    double* __restrict__ A_tile = smem;
+    double* __restrict__ B_tile = smem + TILE_ELEMENTS;
+    double* __restrict__ C_tile = smem + 2 * TILE_ELEMENTS;
+
+    // Block origin - blockIdx.x -> columns, blockIdx.y -> rows
+    int block_col = blockIdx.x * TILE_COLS;  // j dimension
+    int block_row = blockIdx.y * TILE_ROWS;  // i dimension
+
+    // Cooperative load A: global → shared
+    // Coalescing strategy depends on A's layout
     #pragma unroll
     for (int idx = threadIdx.x; idx < TILE_ELEMENTS; idx += BLOCK_SIZE_X) {
+#if A_LAYOUT == 0
+        // Row-major: consecutive threads access consecutive columns (j)
+        // Memory: A[i * N + j], so consecutive j = consecutive addresses
         int ti = idx / TILE_COLS;
         int tj = idx % TILE_COLS;
-        int i = block_ii + ti;
-        int j = block_jj + tj;
-        
-        if (i < N && j < M) {
-            A_tile[idx] = A[A_IDX(i, j)];
+#else
+        // Col-major: consecutive threads access consecutive rows (i)
+        // Memory: A[j * M + i], so consecutive i = consecutive addresses
+        int ti = idx % TILE_ROWS;
+        int tj = idx / TILE_ROWS;
+#endif
+        int i = block_row + ti;
+        int j = block_col + tj;
+        int smem_idx = ti * TILE_COLS + tj;  // shared mem always row-major
+
+        if (i < M && j < N) {
+            A_tile[smem_idx] = A[A_IDX(i, j)];
         } else {
-            A_tile[idx] = 0.0;
+            A_tile[smem_idx] = 0.0;
         }
     }
-    
-    // Cooperative load of B tile to shared memory
+
+    // Cooperative load B: global → shared
+    // Coalescing strategy depends on B's layout
     #pragma unroll
     for (int idx = threadIdx.x; idx < TILE_ELEMENTS; idx += BLOCK_SIZE_X) {
+#if B_LAYOUT == 0
+        // Row-major: consecutive threads access consecutive columns (j)
         int ti = idx / TILE_COLS;
         int tj = idx % TILE_COLS;
-        int i = block_ii + ti;
-        int j = block_jj + tj;
-        
-        if (i < N && j < M) {
-            B_tile[idx] = B[B_IDX(i, j)];
+#else
+        // Col-major: consecutive threads access consecutive rows (i)
+        int ti = idx % TILE_ROWS;
+        int tj = idx / TILE_ROWS;
+#endif
+        int i = block_row + ti;
+        int j = block_col + tj;
+        int smem_idx = ti * TILE_COLS + tj;
+
+        if (i < M && j < N) {
+            B_tile[smem_idx] = B[B_IDX(i, j)];
         } else {
-            B_tile[idx] = 0.0;
+            B_tile[smem_idx] = 0.0;
         }
     }
-    
+
     __syncthreads();
-    
-    // Each thread's local position within shared memory tile
-    int local_ii = threadIdx.x * THREAD_TILE;
-    int local_jj = threadIdx.y * THREAD_TILE;  // = 0 since BLOCK_SIZE_Y = 1
-    
-    // Compute on shared memory with unrolled loops
+
+    // Per-thread computation using strided access
+    // Shared memory is row-major, so this is always efficient
     #pragma unroll
     for (int di = 0; di < THREAD_TILE; di++) {
+        int ti = threadIdx.y + di * BLOCK_SIZE_Y;  // row in tile
+        
         #pragma unroll
         for (int dj = 0; dj < THREAD_TILE; dj++) {
-            int ti = local_ii + di;
-            int tj = local_jj + dj;
+            int tj = threadIdx.x + dj * BLOCK_SIZE_X;  // col in tile
             int smem_idx = ti * TILE_COLS + tj;
-            
+
             C_tile[smem_idx] = (A_tile[smem_idx] + B_tile[smem_idx]) * SCALE;
         }
     }
-    
+
     __syncthreads();
-    
-    // Cooperative store of C tile back to global memory
+
+    // Cooperative store: shared → global
+    // Coalescing strategy depends on A's layout (output goes to A)
     #pragma unroll
     for (int idx = threadIdx.x; idx < TILE_ELEMENTS; idx += BLOCK_SIZE_X) {
+#if A_LAYOUT == 0
+        // Row-major: consecutive threads access consecutive columns
         int ti = idx / TILE_COLS;
         int tj = idx % TILE_COLS;
-        int i = block_ii + ti;
-        int j = block_jj + tj;
-        
-        if (i < N && j < M) {
-            A[A_IDX(i, j)] = C_tile[idx];
+#else
+        // Col-major: consecutive threads access consecutive rows
+        int ti = idx % TILE_ROWS;
+        int tj = idx / TILE_ROWS;
+#endif
+        int i = block_row + ti;
+        int j = block_col + tj;
+        int smem_idx = ti * TILE_COLS + tj;
+
+        if (i < M && j < N) {
+            A[A_IDX(i, j)] = C_tile[smem_idx];
         }
     }
 }
 
 // Host wrapper functions
 void launch_kernel_0(double* d_A, double* d_B) {
-    int total = N * M;
+    int total = M * N;
     int num_blocks = (total + BLOCK_SIZE_X - 1) / BLOCK_SIZE_X;
     dim3 grid(num_blocks);
     dim3 block(BLOCK_SIZE_X, BLOCK_SIZE_Y);
@@ -220,35 +260,42 @@ void launch_kernel_0(double* d_A, double* d_B) {
 }
 
 void launch_kernel_1(double* d_A, double* d_B) {
-    int total = N * M;
+    int total = M * N;
     int num_blocks = (total + BLOCK_SIZE_X - 1) / BLOCK_SIZE_X;
     dim3 grid(num_blocks);
     dim3 block(BLOCK_SIZE_X, BLOCK_SIZE_Y);
     kernel_1<<<grid, block>>>(d_A, d_B);
 }
 
+// grid.x covers columns (N), grid.y covers rows (M)
 template<int TILE_SIZE, int THREAD_TILE>
 void launch_kernel_2(double* d_A, double* d_B) {
-    int totalX = N;
-    int totalY = M;
-    int num_blocksX = (totalX + BLOCK_SIZE_X * THREAD_TILE - 1) / (BLOCK_SIZE_X * THREAD_TILE);
-    int num_blocksY = (totalY + BLOCK_SIZE_Y * THREAD_TILE - 1) / (BLOCK_SIZE_Y * THREAD_TILE);
-    dim3 grid(num_blocksX, num_blocksY);
+    constexpr int TILE_COLS = BLOCK_SIZE_X * THREAD_TILE;
+    constexpr int TILE_ROWS = BLOCK_SIZE_Y * THREAD_TILE;
+    
+    // x dimension covers columns (N), y dimension covers rows (M)
+    int num_blocks_x = (N + TILE_COLS - 1) / TILE_COLS;  // columns
+    int num_blocks_y = (M + TILE_ROWS - 1) / TILE_ROWS;  // rows
+    
+    dim3 grid(num_blocks_x, num_blocks_y);
     dim3 block(BLOCK_SIZE_X, BLOCK_SIZE_Y);
     kernel_2_impl<TILE_SIZE, THREAD_TILE><<<grid, block>>>(d_A, d_B);
 }
 
 template<int TILE_SIZE, int THREAD_TILE>
 void launch_kernel_3(double* d_A, double* d_B) {
-    int totalX = N;
-    int totalY = M;
-    int num_blocksX = (totalX + BLOCK_SIZE_X * THREAD_TILE - 1) / (BLOCK_SIZE_X * THREAD_TILE);
-    int num_blocksY = (totalY + BLOCK_SIZE_Y * THREAD_TILE - 1) / (BLOCK_SIZE_Y * THREAD_TILE);
-    dim3 grid(num_blocksX, num_blocksY);
+    constexpr int TILE_COLS = BLOCK_SIZE_X * THREAD_TILE;
+    constexpr int TILE_ROWS = BLOCK_SIZE_Y * THREAD_TILE;
+    
+    // x dimension covers columns (N), y dimension covers rows (M)
+    int num_blocks_x = (N + TILE_COLS - 1) / TILE_COLS;  // columns
+    int num_blocks_y = (M + TILE_ROWS - 1) / TILE_ROWS;  // rows
+    
+    dim3 grid(num_blocks_x, num_blocks_y);
     dim3 block(BLOCK_SIZE_X, BLOCK_SIZE_Y);
 
     // Shared memory size: 3 tiles (A, B, C)
-    size_t smem_size = 3 * TILE_SIZE * TILE_SIZE * sizeof(double);
+    constexpr size_t smem_size = 3 * TILE_ROWS * TILE_COLS * sizeof(double);
     
     kernel_3_impl<TILE_SIZE, THREAD_TILE><<<grid, block, smem_size>>>(d_A, d_B);
 }
@@ -298,7 +345,7 @@ void dispatch_kernel_3(double* d_A, double* d_B) {
 // Checksum for verification (host)
 static double checksum(double* A) {
     double sum = 0.0;
-    for (int i = 0; i < N * M; i++) {
+    for (int i = 0; i < M * N; i++) {
         sum += A[i];
     }
     return sum;
@@ -306,8 +353,8 @@ static double checksum(double* A) {
 
 int main(int argc, char** argv) {
     // Host arrays
-    double* h_A = (double*)aligned_alloc(64, N * M * sizeof(double));
-    double* h_B = (double*)aligned_alloc(64, N * M * sizeof(double));
+    double* h_A = (double*)aligned_alloc(64, M * N * sizeof(double));
+    double* h_B = (double*)aligned_alloc(64, M * N * sizeof(double));
     
     if (!h_A || !h_B) {
         fprintf(stderr, "Host memory allocation failed\n");
@@ -316,15 +363,15 @@ int main(int argc, char** argv) {
     
     // Device arrays
     double *d_A, *d_B;
-    CUDA_CHECK(cudaMalloc(&d_A, N * M * sizeof(double)));
-    CUDA_CHECK(cudaMalloc(&d_B, N * M * sizeof(double)));
+    CUDA_CHECK(cudaMalloc(&d_A, M * N * sizeof(double)));
+    CUDA_CHECK(cudaMalloc(&d_B, M * N * sizeof(double)));
     
     // Initialize host arrays
     init_arrays(h_A, h_B);
     
     // Copy to device
-    CUDA_CHECK(cudaMemcpy(d_A, h_A, N * M * sizeof(double), cudaMemcpyHostToDevice));
-    CUDA_CHECK(cudaMemcpy(d_B, h_B, N * M * sizeof(double), cudaMemcpyHostToDevice));
+    CUDA_CHECK(cudaMemcpy(d_A, h_A, M * N * sizeof(double), cudaMemcpyHostToDevice));
+    CUDA_CHECK(cudaMemcpy(d_B, h_B, M * N * sizeof(double), cudaMemcpyHostToDevice));
     
     int thread_tile_sizes[] = {1, 2, 4, 8, 16};
     int thread_tile_size = thread_tile_sizes[THREAD_TILE_SEL < 5 ? THREAD_TILE_SEL : 1];
@@ -343,8 +390,8 @@ int main(int argc, char** argv) {
     
     // Re-initialize for timed run
     init_arrays(h_A, h_B);
-    CUDA_CHECK(cudaMemcpy(d_A, h_A, N * M * sizeof(double), cudaMemcpyHostToDevice));
-    CUDA_CHECK(cudaMemcpy(d_B, h_B, N * M * sizeof(double), cudaMemcpyHostToDevice));
+    CUDA_CHECK(cudaMemcpy(d_A, h_A, M * N * sizeof(double), cudaMemcpyHostToDevice));
+    CUDA_CHECK(cudaMemcpy(d_B, h_B, M * N * sizeof(double), cudaMemcpyHostToDevice));
     
     // Create CUDA events for timing
     cudaEvent_t start, stop;
@@ -374,7 +421,7 @@ int main(int argc, char** argv) {
     CUDA_CHECK(cudaEventElapsedTime(&elapsed_ms, start, stop));
     
     // Copy result back
-    CUDA_CHECK(cudaMemcpy(h_A, d_A, N * M * sizeof(double), cudaMemcpyDeviceToHost));
+    CUDA_CHECK(cudaMemcpy(h_A, d_A, M * N * sizeof(double), cudaMemcpyDeviceToHost));
     
     // Compute checksum for verification
     double cs = checksum(h_A);

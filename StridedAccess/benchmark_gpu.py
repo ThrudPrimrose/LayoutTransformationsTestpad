@@ -13,8 +13,8 @@ from pathlib import Path
 from typing import Dict, List, Optional, Any
 
 # Configuration
-N = 4192
-M = 4192
+N = 4096
+M = 4096
 NUM_RUNS = 10
 NUM_NCU_RUNS = 1  # ncu is slow, typically 1 run suffices
 
@@ -39,8 +39,6 @@ THREAD_TILE_CONFIGS = {
     0: "1x1",
     1: "2x2",
     2: "4x4",
-    3: "8x8",
-    4: "16x16",
 }
 
 def layout_str(a_layout: int, b_layout: int) -> str:
@@ -276,12 +274,12 @@ def benchmark_ncu() -> Dict[str, Dict[str, Any]]:
     ncu_results = {}
     combinations = get_valid_combinations()
     
-    for kernel, a_layout, b_layout, tile_sel, thread_tile_sel in combinations:
-        name = variant_name(kernel, a_layout, b_layout, tile_sel, thread_tile_sel)
-        desc = f"K{kernel} ({KERNELS[kernel]}{tile_str(kernel, tile_sel, thread_tile_sel)}), {layout_str(a_layout, b_layout)}"
+    for kernel, a_layout, b_layout, thread_tile_sel in combinations:
+        name = variant_name(kernel, a_layout, b_layout, thread_tile_sel)
+        desc = f"K{kernel} ({KERNELS[kernel]}{tile_str(kernel, thread_tile_sel)}), {layout_str(a_layout, b_layout)}"
         print(f"\n{desc}")
         
-        exe = compile_variant(kernel, a_layout, b_layout, tile_sel, thread_tile_sel)
+        exe = compile_variant(kernel, a_layout, b_layout, thread_tile_sel)
         if not exe:
             ncu_results[name] = {}
             continue
@@ -311,7 +309,7 @@ def print_results(perf_results: Dict, ncu_results: Dict):
         for name in sorted(perf_results.keys()):
             r = perf_results[name]
             kernel_desc = KERNELS[r['kernel']][:12]
-            tile_desc = tile_str(r['kernel'], r['tile_sel'], r['thread_tile_sel'])
+            tile_desc = tile_str(r['kernel'], r['thread_tile_sel'])
             desc = f"K{r['kernel']} ({kernel_desc}{tile_desc}), {layout_str(r['a_layout'], r['b_layout'])}"
             speedup = baseline / r['mean'] if r['mean'] > 0 else 0
             print(f"{desc:<55} {r['mean']:>7.3f} ± {r['stdev']:<6.3f}  {speedup:>6.2f}x")
@@ -345,16 +343,16 @@ def save_results(perf_results: Dict, ncu_results: Dict):
     # Performance CSV
     perf_file = RESULTS_DIR / "cuda_performance.csv"
     with open(perf_file, 'w') as f:
-        f.write("variant,kernel,a_layout,b_layout,block_tile_sel,thread_tile_sel,mean_ms,stdev_ms,min_ms,max_ms,checksum\n")
+        f.write("variant,kernel,a_layout,b_layout,thread_tile_sel,mean_ms,stdev_ms,min_ms,max_ms,checksum\n")
         for name in sorted(perf_results.keys()):
             r = perf_results[name]
-            f.write(f"{name},{r['kernel']},{r['a_layout']},{r['b_layout']},{r['tile_sel']},"
+            f.write(f"{name},{r['kernel']},{r['a_layout']},{r['b_layout']},"
                     f"{r['thread_tile_sel']},{r['mean']:.6f},{r['stdev']:.6f},"
                     f"{r['min']:.6f},{r['max']:.6f},{r['checksum']:.6f}\n")
     
     # NCU metrics CSV
     ncu_file = RESULTS_DIR / "ncu_metrics.csv"
-    
+
     # Collect all unique metric names
     all_metrics = set()
     for metrics in ncu_results.values():
@@ -362,7 +360,7 @@ def save_results(perf_results: Dict, ncu_results: Dict):
     all_metrics = sorted(all_metrics)
     
     with open(ncu_file, 'w') as f:
-        header = "variant,kernel,a_layout,b_layout,block_tile_sel,thread_tile_sel," + ",".join(f'"{m}"' for m in all_metrics)
+        header = "variant,kernel,a_layout,b_layout,thread_tile_sel," + ",".join(f'"{m}"' for m in all_metrics)
         f.write(header + "\n")
         
         for name in sorted(ncu_results.keys()):
@@ -379,7 +377,6 @@ def save_results(perf_results: Dict, ncu_results: Dict):
                 val = ncu_results[name].get(metric, '')
                 row.append(str(val) if val != '' else '')
             f.write(",".join(row) + "\n")
-    
     print(f"\nResults saved to {RESULTS_DIR}/")
     print(f"  - {perf_file}")
     print(f"  - {ncu_file}")
@@ -470,7 +467,7 @@ def main():
         for combo in combinations:
             name = variant_name(*combo)
             ncu_results[name] = {}
-    
+
     # Print and save results
     print_results(perf_results, ncu_results)
     save_results(perf_results, ncu_results)
