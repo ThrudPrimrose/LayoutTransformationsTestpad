@@ -141,16 +141,15 @@ def run_executable(exe: Path, num_runs: int = 1) -> List[Dict[str, Any]]:
 
 def run_ncu_profile(exe: Path, name: str) -> Optional[Path]:
     """Run Nsight Compute profiling with --set=full and save report."""
-    ncu_report = NCU_DIR / f"{name}.ncu-rep"
-    ncu_csv = NCU_DIR / f"{name}.csv"
+    ncu_report = f"{name}"
+
     
     # Run ncu with full metrics set
     cmd = [
         "ncu",
         "--set=full",
         "--force-overwrite",
-        f"--export={ncu_report}",
-        "--csv",
+        f"-o={ncu_report}",
         str(exe)
     ]
     
@@ -369,10 +368,9 @@ def save_results(perf_results: Dict, ncu_results: Dict):
             kernel = parts[0][1:]
             a_layout = parts[1][1:]
             b_layout = parts[2][1:]
-            tile_sel = parts[3][2:]
-            thread_tile_sel = parts[4][2:]
+            thread_tile_sel = parts[3][2:]
             
-            row = [name, kernel, a_layout, b_layout, tile_sel, thread_tile_sel]
+            row = [name, kernel, a_layout, b_layout, thread_tile_sel]
             for metric in all_metrics:
                 val = ncu_results[name].get(metric, '')
                 row.append(str(val) if val != '' else '')
