@@ -13,8 +13,8 @@ from pathlib import Path
 from typing import Dict, List, Optional, Any
 
 # Configuration
-N = 4096
-M = 4096
+N = 4096*4
+M = 4096*4
 NUM_RUNS = 10
 NUM_NCU_RUNS = 1  # ncu is slow, typically 1 run suffices
 
@@ -56,7 +56,7 @@ RESULTS_DIR = SCRIPT_DIR / "results"
 NVCC = "nvcc"
 BASE_FLAGS = ["-std=c++17"]
 OPT_FLAGS = ["-O3", "-lineinfo"]
-ARCH_FLAG = "-arch=sm_80"  # Adjust for your GPU (sm_70, sm_80, sm_86, sm_89, sm_90)
+ARCH_FLAG = "-arch=sm_90a"  # Adjust for your GPU (sm_70, sm_80, sm_86, sm_89, sm_90)
 
 def setup_dirs():
     BUILD_DIR.mkdir(exist_ok=True)
@@ -156,10 +156,7 @@ def run_ncu_profile(exe: Path, name: str) -> Optional[Path]:
     try:
         result = subprocess.run(cmd, capture_output=True, text=True, timeout=600)
         if result.returncode == 0:
-            # Save CSV output
-            with open(ncu_csv, 'w') as f:
-                f.write(result.stdout)
-            return ncu_csv
+            return ncu_report
         else:
             print(f"  NCU error: {result.stderr[:200]}")
             return None

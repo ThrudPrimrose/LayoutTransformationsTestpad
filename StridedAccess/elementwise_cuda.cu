@@ -64,25 +64,55 @@ static constexpr double SCALE = 1.5;
     } \
 } while(0)
 
-// Fast pseudo-random number generator (xorshift64)
-static inline uint64_t xorshift64(uint64_t& state) {
+// Device function: xorshift64 PRNG
+__device__ __forceinline__ uint64_t xorshift64(uint64_t state) {
     state ^= state << 13;
     state ^= state >> 7;
     state ^= state << 17;
     return state;
 }
 
+// Device function: splitmix64 hash to derive unique per-thread state
+// This allows parallel computation of deterministic pseudo-random values
+__device__ __forceinline__ uint64_t splitmix64(uint64_t x) {
+    x += 0x9E3779B97F4A7C15ULL;
+    x = (x ^ (x >> 30)) * 0xBF58476D1CE4E5B9ULL;
+    x = (x ^ (x >> 27)) * 0x94D049BB133111EBULL;
+    return x ^ (x >> 31);
+}
+
+// GPU Kernel: Initialize arrays with deterministic pseudo-random values
+__global__ void __launch_bounds__(256) 
+init_arrays_kernel(double* __restrict__ A, double* __restrict__ B) {
+    const uint64_t BASE_SEED_A = 0x123456789ABCDEF0ULL;
+    const uint64_t BASE_SEED_B = 0xFEDCBA9876543210ULL;
+    
+    int total = M * N;
+    
+    for (int idx = blockIdx.x * blockDim.x + threadIdx.x; 
+         idx < total; 
+         idx += blockDim.x * gridDim.x) {
+        
+        // Derive unique state for this index using splitmix64 hash
+        uint64_t state_a = splitmix64(BASE_SEED_A + idx);
+        uint64_t state_b = splitmix64(BASE_SEED_B + idx);
+        
+        // Apply xorshift64 to get final random value
+        uint64_t rand_a = xorshift64(state_a);
+        uint64_t rand_b = xorshift64(state_b);
+        
+        // Convert to double in range [0, 100)
+        A[idx] = (double)(rand_a % 10000) / 100.0;
+        B[idx] = (double)(rand_b % 10000) / 100.0;
+    }
+}
+
 // Initialize arrays with deterministic pseudo-random values (host)
 // Matrix is M rows x N columns
 static void init_arrays(double* __restrict__ A, double* __restrict__ B) {
-    uint64_t seed_a = 0x123456789ABCDEF0ULL;
-    uint64_t seed_b = 0xFEDCBA9876543210ULL;
-    for (int i = 0; i < M; i++) {       // i = row [0, M)
-        for (int j = 0; j < N; j++) {   // j = col [0, N)
-            A[A_IDX(i, j)] = (double)(xorshift64(seed_a) % 10000) / 100.0;
-            B[B_IDX(i, j)] = (double)(xorshift64(seed_b) % 10000) / 100.0;
-        }
-    }
+    int total_elements = M * N;
+    int num_blocks = (total_elements + BLOCK_SIZE_X - 1) / BLOCK_SIZE_X;
+    init_arrays_kernel<<<num_blocks, BLOCK_SIZE_X>>>(A, B);
 }
 
 // Kernel 0: i-outer, j-inner loop order (row-major traversal pattern)
